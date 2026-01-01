@@ -3,11 +3,12 @@ use std::sync::Arc;
 use crate::{
     clients::{self, tray::TrayState},
     data::InteractGeneric,
+    display_panel::PanelUpdate,
     procs::{
         bar_panel::{BarEvent, BarUpdate},
         menu_panel::{Menu, MenuEvent, MenuUpdate},
     },
-    utils::{BasicTaskMap, ReloadRx},
+    utils::{BasicTaskMap, ReloadRx, fused_lossy_stream},
 };
 use anyhow::Result;
 use crossterm::event::MouseButton;
@@ -46,7 +47,7 @@ fn send_update<T>(tx: &broadcast::Sender<Arc<T>>, upd: T) {
 pub async fn main() -> Result<()> {
     log::debug!("Starting controller");
 
-    let mut subtasks = JoinSet::new();
+    let mut subtasks = JoinSet::<()>::new();
 
     let (do_reload, reload_rx) = ReloadRx::new();
 
@@ -83,27 +84,29 @@ pub async fn main() -> Result<()> {
 
                 let should_reload = !added.is_empty();
                 for display in added {
-                    let bar_ui_tx = bar_ui_tx.subscribe();
+                    let bar_ui_rx = bar_ui_tx.subscribe();
                     let menu_upd_rx = menu_upd_tx_clone.subscribe();
                     let bar_ev_tx = bar_panel_ev_tx.clone();
                     let menu_ev_tx = menu_ev_tx.clone();
                     tasks.insert_spawn(display.clone(), async move {
-                        let mut panels = JoinSet::new();
-                        panels.spawn(super::run_panel_controller_side(
+                        let mut panels = JoinSet::<Result<_, _>>::new();
+                        panels.spawn(super::run_panel_controller_side::<_, PanelUpdate>(
                             "bar-panel.sock",
                             display.clone(),
                             bar_ev_tx,
-                            bar_ui_tx,
+                            fused_lossy_stream(bar_ui_rx),
                             super::bar_panel::controller_spawn_panel,
                         ));
-                        panels.spawn(super::run_panel_controller_side(
+                        panels.spawn(super::run_panel_controller_side::<_, MenuUpdate>(
                             "menu-panel.sock",
                             display.clone(),
                             menu_ev_tx,
-                            menu_upd_rx,
+                            fused_lossy_stream(menu_upd_rx),
                             super::menu_panel::controller_spawn_panel,
                         ));
-                        panels.join_next().await;
+                        if let Some(Err(err)) = panels.join_next().await {
+                            log::error!("{err}");
+                        }
                         panels.abort_all();
                     });
                 }

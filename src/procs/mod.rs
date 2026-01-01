@@ -1,6 +1,7 @@
-use std::{ffi::OsString, path::Path, sync::Arc};
+use std::{borrow::Borrow as _, ffi::OsString, path::Path, sync::Arc};
 
 use anyhow::{Result, anyhow};
+use futures::Stream;
 use serde::{Serialize, de::DeserializeOwned};
 use tempfile::TempDir;
 use tokio::{
@@ -8,6 +9,7 @@ use tokio::{
     sync::mpsc,
     task::JoinSet,
 };
+use tokio_stream::StreamExt as _;
 
 use crate::logging::{ProcKindForLogger, init_logger};
 
@@ -28,7 +30,7 @@ async fn run_panel_controller_side<Ev, Upd>(
     socket_name: &str,
     display: Arc<str>,
     ev_tx: mpsc::UnboundedSender<Ev>,
-    mut upd_rx: tokio::sync::broadcast::Receiver<Arc<Upd>>,
+    updates: impl Stream<Item: std::borrow::Borrow<Upd> + Send> + Send + 'static,
     spawn_panel: impl AsyncFnOnce(
         &Path,
         &str,
@@ -60,30 +62,19 @@ where
     let (stream, _) = listener.accept().await?;
     let (ev_read, mut upd_write) = stream.into_split();
 
-    let mut tasks = tokio::task::JoinSet::new();
-    let display_for_debug = display.clone();
+    let mut tasks = tokio::task::JoinSet::<()>::new();
     tasks.spawn(async move {
-        loop {
-            match upd_rx.recv().await {
-                Ok(update) => {
-                    let Ok(buf) = postcard::to_stdvec_cobs(&update as &Upd)
-                        .map_err(|err| log::error!("Failed to serialize update: {err}"))
-                    else {
-                        continue;
-                    };
+        tokio::pin!(updates);
+        while let Some(update) = updates.next().await {
+            let Ok(buf) = postcard::to_stdvec_cobs(update.borrow())
+                .map_err(|err| log::error!("Failed to serialize update: {err}"))
+            else {
+                continue;
+            };
 
-                    if let Err(err) = upd_write.write_all(&buf).await {
-                        log::error!("Failed to write to update socket: {err}");
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    log::info!("Closing event writer: channel closed");
-                    break;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    log::error!("Panel socket on display {display_for_debug} lagged {n} updates");
-                }
+            if let Err(err) = upd_write.write_all(&buf).await {
+                log::error!("Failed to write to update socket: {err}");
+                break;
             }
         }
     });
@@ -180,7 +171,7 @@ pub async fn entry_point() -> Result<()> {
                 .await?
                 .into_split();
 
-            let mut tasks = JoinSet::new();
+            let mut tasks = JoinSet::<()>::new();
 
             // FIXME: Merge code after display panel migration
             let handle_main = match mode.as_str() {

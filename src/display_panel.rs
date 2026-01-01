@@ -161,7 +161,14 @@ fn part_to_contraint(
     match (*constr, &elem.kind) {
         (tui::Constraint::Length(n), _) => Constraint::Length(n),
         (tui::Constraint::Fill(n), _) => Constraint::Fill(n),
-        (tui::Constraint::FitImage, tui::ElementKind::Image(tui::Image { data, format })) => {
+        (
+            tui::Constraint::Auto,
+            tui::ElementKind::Image(tui::Image {
+                data,
+                format,
+                cached: loaded, // FIXME: Cache (needs mut)
+            }),
+        ) => {
             let (font_w, font_h) = picker.font_size();
             // FIXME: WHY
             let mut ratio = match image::load_from_memory_with_format(data, *format) {
@@ -220,7 +227,11 @@ fn render_recursive(
                 render_recursive(picker, frame, elem, layout, *area);
             }
         }
-        tui::ElementKind::Image(tui::Image { data, format }) => {
+        tui::ElementKind::Image(tui::Image {
+            data,
+            format,
+            cached: loaded, // FIXME: cache (need mut)
+        }) => {
             let Ok(img) = image::load_from_memory_with_format(data, *format)
                 .map_err(|err| log::error!("Failed to load image: {err}"))
             else {
@@ -282,10 +293,10 @@ fn render_recursive(
             }
             frame.render_widget(block, area);
         }
-        tui::ElementKind::Raw(raw) => {
+        tui::ElementKind::PlainText(raw) => {
             frame.render_widget(widgets::Paragraph::new(raw as &str), area);
         }
-        tui::ElementKind::Spacing => {}
+        tui::ElementKind::Empty => {}
     }
 }
 // FIXME: Make private

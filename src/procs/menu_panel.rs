@@ -16,6 +16,7 @@ use tokio_stream::StreamExt;
 use crate::{
     clients::tray::{TrayMenuExt, TrayMenuInteract},
     data::{ActiveMonitorInfo, InteractKind, Location},
+    tui,
     utils::rect_center,
 };
 
@@ -152,6 +153,14 @@ pub enum MenuUpdate {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MenuInteractTarget {
     TrayMenu(crate::clients::tray::TrayMenuInteract),
+}
+impl MenuInteractTarget {
+    fn serialize_tag(&self) -> tui::InteractTag {
+        tui::InteractTag::from_bytes(&postcard::to_stdvec(self).unwrap())
+    }
+    fn deserialize_tag(tag: &tui::InteractTag) -> Self {
+        postcard::from_bytes(tag.as_bytes()).unwrap()
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -487,6 +496,116 @@ fn render_tray_menu_item(
         _ => log::warn!("Unhandled menu item: {item:#?}"),
     }
 }
+fn tray_menu_item_to_tui(
+    depth: u16,
+    item: &system_tray::menu::MenuItem,
+    addr: &Arc<str>,
+    menu_path: Option<&Arc<str>>,
+) -> Option<tui::Element> {
+    use system_tray::menu::*;
+    let main_elem = match item {
+        MenuItem { visible: false, .. } => return None,
+        MenuItem {
+            visible: true,
+            menu_type: MenuType::Separator,
+            ..
+        } => tui::Element {
+            tag: None,
+            kind: tui::ElementKind::Block(tui::Block {
+                borders: tui::Borders {
+                    top: true,
+                    ..Default::default()
+                },
+                border_style: tui::Style {
+                    fg: Some(tui::Color::DarkGray),
+                    ..Default::default()
+                },
+                border_set: tui::LineSet::normal(),
+                inner: None,
+            }),
+        },
+
+        MenuItem {
+            id,
+            menu_type: MenuType::Standard,
+            label: Some(label),
+            enabled: _,
+            visible: true,
+            icon_name: _,
+            icon_data,
+            shortcut: _,
+            toggle_type: _,  // TODO
+            toggle_state: _, // TODO
+            children_display: _,
+            disposition: _, // TODO: ???
+            submenu,
+        } => tui::Element {
+            tag: menu_path.map(|it| {
+                MenuInteractTarget::TrayMenu(TrayMenuInteract {
+                    addr: addr.clone(),
+                    menu_path: it.clone(),
+                    id: *id,
+                })
+                .serialize_tag()
+            }),
+            kind: if let Some(icon) = icon_data {
+                tui::ElementKind::Subdivide(tui::Subdiv {
+                    axis: tui::Axis::Horizontal,
+                    // FIXME: Put in the first line instead
+                    parts: Box::new([
+                        tui::SubPart {
+                            constr: tui::Constraint::Auto,
+                            elem: tui::Element {
+                                tag: None,
+                                kind: tui::ElementKind::Image(tui::Image {
+                                    data: icon.clone(),
+                                    format: image::ImageFormat::Png,
+                                    cached: None,
+                                }),
+                            },
+                        },
+                        tui::SubPart {
+                            constr: tui::Constraint::Auto,
+                            elem: tui::Element {
+                                tag: None,
+                                kind: tui::ElementKind::PlainText(label.as_str().into()),
+                            },
+                        },
+                    ]),
+                })
+            } else {
+                tui::ElementKind::PlainText(label.as_str().into())
+            },
+        },
+
+        _ => {
+            log::error!("Unhandled menu item: {item:#?}");
+            return None;
+        }
+    };
+
+    Some(if item.submenu.is_empty() {
+        main_elem
+    } else {
+        tui::Element {
+            tag: None,
+            kind: tui::Subdiv {
+                axis: tui::Axis::Vertical,
+                parts: Box::new([
+                    tui::SubPart {
+                        constr: tui::Constraint::Auto,
+                        elem: main_elem,
+                    },
+                    tui::SubPart {
+                        constr: tui::Constraint::Auto,
+                        elem: tray_menu_to_tui(depth + 1, &item.submenu, addr, menu_path),
+                    },
+                ]),
+            }
+            .into(),
+        }
+    })
+}
 
 fn render_tray_menu(
     picker: &Picker,
@@ -505,6 +624,49 @@ fn render_tray_menu(
         render_tray_menu_item(picker, depth, item, addr, menu_path, out);
     }
 }
+fn tray_menu_to_tui(
+    depth: u16,
+    items: &[system_tray::menu::MenuItem],
+    addr: &Arc<str>,
+    menu_path: Option<&Arc<str>>,
+) -> tui::Element {
+    let subdiv = tui::Subdiv {
+        axis: tui::Axis::Vertical,
+        parts: items
+            .iter()
+            .filter_map(|item| {
+                Some(tui::SubPart {
+                    constr: tui::Constraint::Auto,
+                    elem: tray_menu_item_to_tui(depth, item, addr, menu_path)?,
+                })
+            })
+            .collect(),
+    };
+
+    tui::Element {
+        tag: None,
+        kind: tui::ElementKind::Subdivide(tui::Subdiv {
+            axis: tui::Axis::Horizontal,
+            parts: Box::new([
+                tui::SubPart {
+                    constr: tui::Constraint::Length(1),
+                    elem: tui::Element {
+                        kind: tui::ElementKind::Empty,
+                        tag: None,
+                    },
+                },
+                tui::SubPart {
+                    constr: tui::Constraint::Auto,
+                    elem: tui::Element {
+                        tag: None,
+                        kind: tui::ElementKind::Subdivide(subdiv),
+                    },
+                },
+            ]),
+        }),
+    }
+}
+
 fn render_or_calc(picker: &Picker, menu: &Menu, out: &mut RenderReq) {
     match menu {
         Menu::None => (),
@@ -568,6 +730,75 @@ fn render_or_calc(picker: &Picker, menu: &Menu, out: &mut RenderReq) {
             }
         }
     }
+}
+pub fn to_tui(menu: &Menu) -> Option<tui::Tui> {
+    Some(match menu {
+        Menu::None => return None,
+        Menu::TrayContext {
+            addr,
+            tmenu:
+                TrayMenuExt {
+                    id: _,
+                    menu_path,
+                    submenus,
+                },
+        } => {
+            // Then render the items
+            tui::Tui {
+                root: tui::Element {
+                    tag: None,
+                    kind: tui::ElementKind::Block(tui::Block {
+                        borders: tui::Borders::all(),
+                        border_style: tui::Style {
+                            fg: Some(tui::Color::DarkGray),
+                            ..Default::default()
+                        },
+                        border_set: tui::LineSet::thick(),
+                        inner: Some(Box::new(tray_menu_to_tui(
+                            0,
+                            submenus,
+                            addr,
+                            menu_path.as_ref(),
+                        ))),
+                    }),
+                },
+            }
+        }
+        Menu::TrayTooltip {
+            addr: _,
+            tooltip:
+                Tooltip {
+                    icon_name: _,
+                    icon_data: _,
+                    title,
+                    description,
+                },
+        } => tui::Tui {
+            root: tui::Element {
+                tag: None,
+                kind: tui::Subdiv {
+                    axis: tui::Axis::Vertical,
+                    parts: Box::new([
+                        tui::SubPart {
+                            constr: tui::Constraint::Auto,
+                            elem: tui::Element {
+                                tag: None,
+                                kind: tui::ElementKind::PlainText(title.as_str().into()),
+                            },
+                        },
+                        tui::SubPart {
+                            constr: tui::Constraint::Auto,
+                            elem: tui::Element {
+                                tag: None,
+                                kind: tui::ElementKind::PlainText(description.as_str().into()),
+                            },
+                        },
+                    ]),
+                }
+                .into(),
+            },
+        },
+    })
 }
 fn calc_size(picker: &Picker, menu: &Menu) -> Size {
     let mut size = Size::default();
