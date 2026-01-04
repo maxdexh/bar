@@ -32,7 +32,7 @@ pub fn connect(
     impl Stream<Item = PulseState>,
 ) {
     let (ev_tx, ev_rx) = broadcast::channel(50);
-    tokio::task::spawn_blocking(|| match run_blocking(ev_tx, reload_rx) {
+    std::thread::spawn(|| match run_blocking(ev_tx, reload_rx) {
         Ok(()) => log::warn!("PulseAudio client has quit"),
         Err(err) => log::error!("PulseAudio client has failed: {err}"),
     });

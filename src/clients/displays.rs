@@ -13,7 +13,7 @@ pub struct DisplayDiff {
 pub fn connect() -> impl Stream<Item = DisplayDiff> {
     let (tx, mut rx) = mpsc::unbounded_channel();
 
-    tokio::task::spawn_blocking(move || {
+    std::thread::spawn(move || {
         let sleep_ms = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
         let sleep_err = || sleep_ms(2000);
 
