@@ -2,15 +2,15 @@ use std::io::Write;
 
 use crate::tui::*;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct SizingContext {
     pub font_size: Size,
     pub div_w: Option<u16>,
     pub div_h: Option<u16>,
 }
-pub struct RenderCtx<W> {
-    pub writer: W,
-    pub layout: RenderedLayout,
+pub struct RenderCtx<'a, W> {
+    pub writer: &'a mut W,
+    pub layout: &'a mut RenderedLayout,
 }
 
 impl Tui {
@@ -38,7 +38,7 @@ impl Elem {
             Self::Empty => Ok(Size::default()),
         })
     }
-    fn render(
+    pub fn render(
         &mut self,
         ctx: &mut RenderCtx<impl Write>,
         sizing: SizingContext,
@@ -247,7 +247,7 @@ impl Stack {
         assert_eq!(lens.len(), self.parts.len());
 
         let fill_len = rem_len.unwrap_or_else(|| {
-            log::warn!("Content of does not fit into {area:?}: {self:#?}");
+            log::warn!("Stack does not fit into {area:?}: {self:?}");
             0
         });
 
@@ -486,9 +486,11 @@ pub fn draw(
         &mut RenderCtx<std::io::BufWriter<std::io::StdoutLock<'static>>>,
     ) -> std::io::Result<()>,
 ) -> std::io::Result<RenderedLayout> {
+    let mut layout = Default::default();
+    let mut writer = std::io::BufWriter::new(std::io::stdout().lock());
     let mut ctx = RenderCtx {
-        layout: Default::default(),
-        writer: std::io::BufWriter::new(std::io::stdout().lock()),
+        layout: &mut layout,
+        writer: &mut writer,
     };
     crossterm::queue!(
         ctx.writer,
@@ -497,5 +499,23 @@ pub fn draw(
     )?;
     doit(&mut ctx)?;
     crossterm::execute!(ctx.writer, crossterm::terminal::EndSynchronizedUpdate)?;
-    Ok(ctx.layout)
+    Ok(layout)
+}
+pub fn draw_to<W: std::io::Write>(
+    writer: &mut W,
+    doit: impl FnOnce(&mut RenderCtx<W>) -> std::io::Result<()>,
+) -> std::io::Result<RenderedLayout> {
+    let mut layout = Default::default();
+    let mut ctx = RenderCtx {
+        layout: &mut layout,
+        writer,
+    };
+    crossterm::queue!(
+        ctx.writer,
+        crossterm::terminal::BeginSynchronizedUpdate,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+    )?;
+    doit(&mut ctx)?;
+    crossterm::execute!(ctx.writer, crossterm::terminal::EndSynchronizedUpdate)?;
+    Ok(layout)
 }

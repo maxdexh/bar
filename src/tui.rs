@@ -145,6 +145,7 @@ impl Borders {
 #[derive(Default, Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Constr {
     Length(u16),
+    // FIXME: Remove, to make the precalculated size absolute. Use cursor movement for bar sides
     Fill(u16),
     #[default]
     Auto,
@@ -192,6 +193,7 @@ impl StackItem {
     }
 }
 
+// TODO: Tagging system for partial updates?
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Tui {
     pub root: Elem,

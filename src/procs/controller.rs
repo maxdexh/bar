@@ -3,12 +3,11 @@ use std::sync::Arc;
 use crate::{
     clients::{self, tray::TrayState},
     data::InteractGeneric,
-    display_panel::PanelUpdate,
     procs::{
         bar_panel::{BarEvent, BarUpdate},
         menu_panel::{Menu, MenuEvent, MenuUpdate},
     },
-    utils::{BasicTaskMap, ReloadRx, broadcast_stream},
+    utils::{BasicTaskMap, Emit, ReloadRx, broadcast_stream, dump_stream, ubchan},
 };
 use anyhow::Result;
 use crossterm::event::MouseButton;
@@ -25,12 +24,6 @@ async fn into_send_all<T: serde::Serialize + Send + 'static>(
     tokio::pin!(stream);
     while let Some(upd) = stream.next().await {
         send_update(&tx, upd)
-    }
-}
-async fn into_send_all2<T>(tx: impl Fn(T), stream: impl futures::Stream<Item = T>) {
-    tokio::pin!(stream);
-    while let Some(upd) = stream.next().await {
-        tx(upd)
     }
 }
 
@@ -51,23 +44,26 @@ pub async fn main() -> Result<()> {
 
     let (do_reload, reload_rx) = ReloadRx::new();
 
-    let (bar_upd_send, bar_events, menu_tx, menu_events) = {
-        // TODO: Consider using WeakSender
-        let bar_ui_tx = broadcast::Sender::new(100);
-
+    let (mut bar_upd_send, bar_events, menu_tx, menu_events) = {
         let menu_upd_tx = broadcast::Sender::<Arc<MenuUpdate>>::new(1000);
 
         // Channel to receive events from panels. Messages are collected
         // into an unbounded channel to ensure that we do not block the
         // sockets.
-        let (bar_panel_ev_tx, bar_panel_ev_rx) = mpsc::unbounded_channel();
         let (menu_ev_tx, mut menu_ev_rx) = mpsc::unbounded_channel();
 
-        let (bar_send, bar_events) = crate::procs::bar_panel::control_panels(
-            &mut subtasks,
-            bar_ui_tx.clone(),
-            bar_panel_ev_rx,
-        );
+        //let (bar_send, bar_events) = crate::procs::bar_panel::control_panels(
+        //    &mut subtasks,
+        //    bar_ui_tx.clone(),
+        //    bar_panel_ev_rx,
+        //);
+        let (monitor_tx, monitor_rx) = ubchan();
+        let (bar_send, bar_upd_rx) = ubchan();
+        let (bar_ev_tx, bar_events) = ubchan();
+        clients::monitors::connect(monitor_tx);
+        subtasks.spawn(crate::procs::bar_panel::run_bar_panel_manager(
+            monitor_rx, bar_upd_rx, bar_ev_tx,
+        ));
 
         let menu_upd_tx_clone = menu_upd_tx.clone();
         subtasks.spawn(async move {
@@ -84,19 +80,10 @@ pub async fn main() -> Result<()> {
 
                 let should_reload = !added.is_empty();
                 for display in added {
-                    let bar_ui_rx = bar_ui_tx.subscribe();
                     let menu_upd_rx = menu_upd_tx_clone.subscribe();
-                    let bar_ev_tx = bar_panel_ev_tx.clone();
                     let menu_ev_tx = menu_ev_tx.clone();
                     tasks.insert_spawn(display.clone(), async move {
                         let mut panels = JoinSet::<Result<_, _>>::new();
-                        panels.spawn(super::run_panel_controller_side::<_, PanelUpdate>(
-                            "bar-panel.sock",
-                            display.clone(),
-                            bar_ev_tx,
-                            broadcast_stream(bar_ui_rx),
-                            super::bar_panel::controller_spawn_panel,
-                        ));
                         panels.spawn(super::run_panel_controller_side::<_, MenuUpdate>(
                             "menu-panel.sock",
                             display.clone(),
@@ -126,7 +113,7 @@ pub async fn main() -> Result<()> {
 
     {
         let (ws, am) = clients::hypr::connect(reload_rx.resubscribe());
-        subtasks.spawn(into_send_all2(
+        subtasks.spawn(dump_stream(
             bar_upd_send.clone(),
             ws.map(BarUpdate::Desktop),
         ));
@@ -135,11 +122,11 @@ pub async fn main() -> Result<()> {
             am.map(MenuUpdate::ActiveMonitor),
         ));
     }
-    subtasks.spawn(into_send_all2(
+    subtasks.spawn(dump_stream(
         bar_upd_send.clone(),
         clients::upower::connect(reload_rx.resubscribe()).map(BarUpdate::Energy),
     ));
-    subtasks.spawn(into_send_all2(
+    subtasks.spawn(dump_stream(
         bar_upd_send.clone(),
         clients::clock::connect(reload_rx.resubscribe()).map(BarUpdate::Time),
     ));
@@ -156,7 +143,7 @@ pub async fn main() -> Result<()> {
     };
     let ppd_switch_tx = {
         let (tx, profiles) = clients::ppd::connect(reload_rx.resubscribe());
-        subtasks.spawn(into_send_all2(
+        subtasks.spawn(dump_stream(
             bar_upd_send.clone(),
             profiles.map(BarUpdate::Ppd),
         ));
@@ -164,7 +151,7 @@ pub async fn main() -> Result<()> {
     };
     let audio_upd_tx = {
         let (tx, events) = clients::pulse::connect(reload_rx.resubscribe());
-        subtasks.spawn(into_send_all2(
+        subtasks.spawn(dump_stream(
             bar_upd_send.clone(),
             events.map(BarUpdate::Pulse),
         ));
@@ -173,7 +160,7 @@ pub async fn main() -> Result<()> {
 
     // TODO: Try to parallelize this further.
     let big_stream = tray_stream
-        .merge(bar_events.map(Upd::Bar))
+        .merge(bar_events.map(|(_info, ev)| ev).map(Upd::Bar)) // FIXME: Use info
         .merge(menu_events.map(Upd::Menu));
     tokio::pin!(big_stream);
 
@@ -186,7 +173,12 @@ pub async fn main() -> Result<()> {
         // in that case.
         match controller_update {
             Upd::Tray(event, state) => {
-                bar_upd_send(BarUpdate::SysTray(state.items.clone()));
+                if bar_upd_send
+                    .emit(BarUpdate::SysTray(state.items.clone()))
+                    .is_break()
+                {
+                    break;
+                }
                 tray_state = state;
 
                 match event {

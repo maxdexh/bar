@@ -1,8 +1,10 @@
+#![allow(clippy::collapsible_if)]
+
 mod clients;
 mod data;
-mod display_panel;
 mod logging;
 mod procs;
+mod terminals;
 mod tui;
 mod utils;
 

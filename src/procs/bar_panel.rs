@@ -1,102 +1,287 @@
-use std::{ffi::OsString, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use system_tray::item::StatusNotifierItem;
-use tokio::{
-    sync::{broadcast, mpsc},
-    task::JoinSet,
-};
+use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
 
 use crate::{
     clients::{
+        monitors::MonitorEvent,
         pulse::{PulseDeviceKind, PulseDeviceState, PulseState},
         upower::{BatteryState, EnergyState},
     },
     data::{BasicDesktopState, WorkspaceId},
-    display_panel::{PanelEvent, PanelUpdate},
+    terminals::{SpawnTerm, TermEvent, TermId, TermMgrUpdate, TermUpdate},
     tui,
+    utils::{Emit as _, SharedEmit, ubchan, unb_rx_stream},
 };
 
-pub async fn controller_spawn_panel(
-    _: &std::path::Path,
-    display: &str,
-    envs: Vec<(OsString, OsString)>,
-    _: &tokio::sync::mpsc::UnboundedSender<impl Sized>,
-) -> anyhow::Result<tokio::process::Child> {
-    let child = tokio::process::Command::new("kitten")
-        .envs(envs)
-        .stdout(std::io::stderr())
-        .args([
-            "panel",
-            &format!("--output-name={display}"),
-            // Allow logging to $KITTY_STDIO_FORWARDED
-            "-o=forward_stdio=yes",
-            // Do not use the system's kitty.conf
-            "--config=NONE",
-            // Basic look of the bar
-            "-o=foreground=white",
-            "-o=background=black",
-            // location of the bar
-            &format!("--edge={}", super::EDGE),
-            // disable hiding the mouse
-            "-o=mouse_hide_wait=0",
-        ])
-        .arg(&std::env::current_exe()?)
-        .args(["internal", super::INTERNAL_BAR_PANEL_ARG])
-        .kill_on_drop(true)
-        .spawn()?;
-
-    Ok(child)
-}
-
-pub fn control_panels(
-    tasks: &mut JoinSet<()>,
-    panel_upd_tx: broadcast::Sender<Arc<PanelUpdate>>,
-    mut panel_ev_rx: mpsc::UnboundedReceiver<PanelEvent>,
-) -> (
-    impl Fn(BarUpdate) + Send + 'static + Clone + use<>,
-    impl Stream<Item = BarEvent> + use<>,
+pub async fn run_bar_panel_manager(
+    monitor_rx: impl Stream<Item = MonitorEvent> + Send + 'static,
+    bar_upd_rx: impl Stream<Item = BarUpdate> + Send + 'static,
+    bar_ev_tx: impl SharedEmit<(BarEventInfo, BarEvent)>,
 ) {
-    let (bar_upd_tx, mut bar_upd_rx) = mpsc::unbounded_channel();
+    let mut tasks = JoinSet::new();
+
+    let mut term_upd_tx;
+    {
+        let term_upd_rx;
+        (term_upd_tx, term_upd_rx) = ubchan();
+        tasks.spawn(crate::terminals::run_term_manager(term_upd_rx));
+    }
+
     tasks.spawn(async move {
+        struct Instance {
+            monitor_name: Arc<str>,
+            listener: tokio::task::AbortHandle,
+            upd_tx: tokio::sync::mpsc::UnboundedSender<Arc<BarState>>,
+        }
+        let mut instances = HashMap::<TermId, Instance>::new();
+        let mut by_monitor = HashMap::<Arc<str>, HashSet<TermId>>::new();
+        let mut subtasks = JoinSet::new();
+
+        enum Upd {
+            Monitor(MonitorEvent),
+            Broadcast(BarUpdate),
+        }
+        let updates = monitor_rx
+            .map(Upd::Monitor)
+            .merge(bar_upd_rx.map(Upd::Broadcast));
+        tokio::pin!(updates);
+
         let mut state = BarState::default();
 
-        while let Some(upd) = bar_upd_rx.recv().await {
-            state.apply_update(upd);
-            while let Ok(upd) = bar_upd_rx.try_recv() {
-                state.apply_update(upd);
-            }
-            if panel_upd_tx
-                .send(Arc::new(PanelUpdate::Display(to_tui(&state))))
-                .is_err()
-            {
-                log::warn!("No panels to update")
+        loop {
+            let upd = tokio::select! {
+                Some(upd) = updates.next() => upd,
+                Some(res) = subtasks.join_next() => {
+                    if let Err(err) = res && !err.is_cancelled() {
+                        log::error!("Error with task: {err}");
+                    }
+                    continue;
+                }
+            };
+
+            match upd {
+                Upd::Broadcast(upd) => {
+                    state.apply_update(upd);
+                    let state = Arc::new(state.clone());
+
+                    let mut shutdown_queue = Vec::new();
+                    for (term_id, inst) in &mut instances {
+                        if inst.upd_tx.send(state.clone()).is_err() {
+                            shutdown_queue.push(term_id.clone());
+                        }
+                    }
+                    if !shutdown_queue.is_empty() {
+                        for id in &shutdown_queue {
+                            let Some(inst) = instances.remove(id) else {
+                                continue;
+                            };
+                            if let Some(insts) = by_monitor.get_mut(&inst.monitor_name) {
+                                insts.remove(id);
+                            }
+                            inst.listener.abort();
+                        }
+                        if term_upd_tx
+                            .emit(TermMgrUpdate::TermUpdate(
+                                shutdown_queue,
+                                TermUpdate::Shutdown,
+                            ))
+                            .is_break()
+                        {
+                            break;
+                        }
+                    }
+                }
+                Upd::Monitor(ev) => {
+                    let removed: Vec<_> = ev
+                        .removed()
+                        .chain(ev.added().map(|it| &it.name as &str))
+                        .flat_map(|name| by_monitor.remove(name).unwrap_or_default())
+                        .filter_map(|id| instances.remove_entry(&id))
+                        .map(|(id, inst)| {
+                            inst.listener.abort();
+                            id
+                        })
+                        .collect();
+
+                    if !removed.is_empty()
+                        && term_upd_tx
+                            .emit(TermMgrUpdate::TermUpdate(removed, TermUpdate::Shutdown))
+                            .is_break()
+                    {
+                        break;
+                    }
+
+                    for monitor in ev.added() {
+                        let bar_info = BarEventInfo {
+                            monitor_name: monitor.name.clone(),
+                        };
+                        let term_id = TermId::from_bytes(monitor.name.as_bytes());
+                        let (bar_upd_tx, bar_upd_rx) = tokio::sync::mpsc::unbounded_channel();
+                        let (term_ev_tx, term_ev_rx) = tokio::sync::mpsc::unbounded_channel();
+                        let listener = subtasks.spawn(run_instance_controller(
+                            monitor.name.clone(),
+                            {
+                                let mut bar_ev_tx = bar_ev_tx.clone();
+                                move |ev| bar_ev_tx.emit((bar_info.clone(), ev))
+                            },
+                            unb_rx_stream(bar_upd_rx),
+                            {
+                                let mut term_upd_tx = term_upd_tx.clone();
+                                let term_id = term_id.clone();
+                                move |upd| {
+                                    term_upd_tx
+                                        .emit(TermMgrUpdate::TermUpdate(vec![term_id.clone()], upd))
+                                }
+                            },
+                            unb_rx_stream(term_ev_rx),
+                        ));
+                        if term_upd_tx
+                            .emit(TermMgrUpdate::SpawnPanel(SpawnTerm {
+                                term_id: term_id.clone(),
+                                extra_args: vec![
+                                    format!("--output-name={}", monitor.name).into(),
+                                    // Allow logging to $KITTY_STDIO_FORWARDED
+                                    "-o=forward_stdio=yes".into(),
+                                    // Do not use the system's kitty.conf
+                                    "--config=NONE".into(),
+                                    // Basic look of the bar
+                                    "-o=foreground=white".into(),
+                                    "-o=background=black".into(),
+                                    // location of the bar
+                                    format!("--edge={}", super::EDGE).into(),
+                                    // disable hiding the mouse
+                                    "-o=mouse_hide_wait=0".into(),
+                                ],
+                                extra_envs: Default::default(),
+                                event_tx: term_ev_tx,
+                            }))
+                            .is_break()
+                        {
+                            break;
+                        }
+                        by_monitor
+                            .entry(monitor.name.clone())
+                            .or_default()
+                            .insert(term_id.clone());
+                        let old = instances.insert(
+                            term_id,
+                            Instance {
+                                monitor_name: monitor.name.clone(),
+                                listener,
+                                upd_tx: bar_upd_tx,
+                            },
+                        );
+                        assert!(old.is_none());
+                    }
+                }
             }
         }
     });
-    (
-        move |upd: BarUpdate| {
-            bar_upd_tx.send(upd).unwrap();
-        },
-        futures::stream::poll_fn(move |cx| panel_ev_rx.poll_recv(cx)).map(|panel_event| {
-            match panel_event {
-                PanelEvent::Interact(tui::TuiInteract {
-                    location,
-                    target,
-                    kind,
-                }) => BarEvent::Interact(Interact {
-                    location,
-                    kind,
-                    target: match target {
-                        Some(tag) => BarInteractTarget::deserialize_tag(&tag),
-                        None => BarInteractTarget::None,
-                    },
-                }),
+
+    if let Some(Err(err)) = tasks.join_next().await {
+        log::error!("Error with task: {err}");
+    }
+}
+async fn run_instance_controller(
+    monitor_name: Arc<str>, // TODO: Use for workspaces
+    mut ev_tx: impl SharedEmit<BarEvent>,
+    upd_rx: impl Stream<Item = Arc<BarState>> + 'static + Send,
+    mut term_upd_tx: impl SharedEmit<TermUpdate>,
+    term_ev_rx: impl Stream<Item = TermEvent> + 'static + Send,
+) {
+    tokio::pin!(term_ev_rx);
+
+    let Ok(mut sizes) = tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(TermEvent::Sizes(sizes)) = term_ev_rx.next().await {
+                break sizes;
             }
-        }),
-    )
+        }
+    })
+    .await
+    .map_err(|err| log::error!("Failed to receive terminal sizes: {err}")) else {
+        return;
+    };
+
+    enum Inc {
+        Bar(Arc<BarState>),
+        Term(TermEvent),
+    }
+    let incoming = upd_rx.map(Inc::Bar).merge(term_ev_rx.map(Inc::Term));
+    tokio::pin!(incoming);
+
+    // TODO: pass monitor name
+    let mut tui = to_tui(&BarState::default());
+    let mut layout = tui::RenderedLayout::default();
+    while let Some(inc) = incoming.next().await {
+        let mut rerender = false;
+        match inc {
+            Inc::Bar(new_state) => {
+                tui = to_tui(&new_state);
+                rerender = true;
+            }
+            Inc::Term(TermEvent::Crossterm(ev)) => {
+                if let crossterm::event::Event::Mouse(ev) = ev
+                    && let Some(tui::TuiInteract {
+                        location,
+                        target,
+                        kind,
+                    }) = layout.interpret_mouse_event(ev, sizes.font_size())
+                {
+                    let interact = Interact {
+                        location,
+                        kind,
+                        target: match target {
+                            Some(tag) => BarInteractTarget::deserialize_tag(&tag),
+                            None => BarInteractTarget::None,
+                        },
+                    };
+                    if ev_tx.emit(BarEvent::Interact(interact)).is_break() {
+                        break;
+                    }
+                }
+            }
+            Inc::Term(TermEvent::Sizes(new_sizes)) => {
+                sizes = new_sizes;
+                rerender = true;
+            }
+        }
+        if rerender {
+            let mut buf = Vec::new();
+            match tui::draw_to(&mut buf, |ctx| {
+                let size = sizes.cell_size;
+                log::debug!("{size:?}");
+                tui.render(
+                    ctx,
+                    tui::SizingContext {
+                        font_size: sizes.font_size(),
+                        div_w: Some(size.w),
+                        div_h: Some(size.h),
+                    },
+                    tui::Area {
+                        size,
+                        pos: Default::default(),
+                    },
+                )
+            }) {
+                Err(err) => log::error!("Failed to draw: {err}"),
+                Ok(new_layout) => layout = new_layout,
+            }
+            if term_upd_tx.emit(TermUpdate::Print(buf)).is_break()
+                || term_upd_tx.emit(TermUpdate::Flush).is_break()
+            {
+                break;
+            }
+        }
+    }
 }
 
 type Interact = crate::data::InteractGeneric<BarInteractTarget>;
@@ -104,6 +289,10 @@ type Interact = crate::data::InteractGeneric<BarInteractTarget>;
 #[derive(Serialize, Deserialize, Debug)]
 pub enum BarEvent {
     Interact(Interact),
+}
+#[derive(Clone, Debug)]
+pub struct BarEventInfo {
+    pub monitor_name: Arc<str>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

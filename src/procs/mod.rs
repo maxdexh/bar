@@ -17,7 +17,6 @@ pub mod bar_panel;
 pub mod controller;
 pub mod menu_panel;
 
-const INTERNAL_BAR_PANEL_ARG: &str = "bar";
 const INTERNAL_MENU_ARG: &str = "menu";
 const EDGE: &str = "top";
 
@@ -159,6 +158,8 @@ pub async fn entry_point() -> Result<()> {
     let mut args = std::env::args().skip(1);
 
     match args.next().as_deref() {
+        Some(crate::terminals::INTERNAL_ARG) => crate::terminals::term_proc_main().await,
+        // FIXME: Remove
         Some("internal") => {
             let mode = args.next().ok_or_else(|| anyhow!("Missing mode arg"))?;
 
@@ -173,27 +174,7 @@ pub async fn entry_point() -> Result<()> {
 
             let mut tasks = JoinSet::<()>::new();
 
-            // FIXME: Merge code after display panel migration
             let handle_main = match mode.as_str() {
-                INTERNAL_BAR_PANEL_ARG => {
-                    init_logger(ProcKindForLogger::Bar(monitor.clone()));
-                    let (upd_tx, upd_rx) = mpsc::unbounded_channel();
-                    let (ev_tx, ev_rx) = mpsc::unbounded_channel();
-                    tasks.spawn(read_cobs_sock(upd_read, upd_tx));
-                    tasks.spawn(write_cobs_sock(ev_write, ev_rx));
-
-                    let (fut_main, handle_main) = futures::future::abortable(async move {
-                        if let Err(err) =
-                            crate::display_panel::main(ev_tx, upd_rx, monitor.into()).await
-                        {
-                            log::error!("Bar panel failed: {err}");
-                        }
-                    });
-                    let fut_io = tasks.join_next();
-                    tokio::pin!(fut_io, fut_main);
-                    _ = futures::future::select(fut_main, fut_io).await;
-                    handle_main
-                }
                 INTERNAL_MENU_ARG => {
                     init_logger(ProcKindForLogger::Menu(monitor));
                     let (upd_tx, upd_rx) = mpsc::unbounded_channel();

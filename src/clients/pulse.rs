@@ -91,11 +91,13 @@ fn run_blocking(tx: broadcast::Sender<PulseState>, mut reload_rx: ReloadRx) -> a
     log::info!("Connecting to PulseAudio");
 
     let awaiting_reload = Arc::new(AtomicBool::new(false));
-    tokio::spawn({
+    std::thread::spawn({
         let awaiting_reload = awaiting_reload.clone();
-        async move {
+        move || {
             while Arc::strong_count(&awaiting_reload) > 1 {
-                reload_rx.wait().await;
+                let Some(()) = reload_rx.blocking_wait() else {
+                    break;
+                };
                 awaiting_reload.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }

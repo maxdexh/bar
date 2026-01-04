@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{data::Position32, tui::*};
 
-#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Area {
     pub pos: Position,
     pub size: Size,
@@ -83,7 +83,7 @@ pub enum Axis {
     Vertical,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RenderedLayout {
     pub widgets: Vec<(Area, InteractTag)>,
 }
@@ -155,3 +155,42 @@ impl RenderedLayout {
     }
 }
 pub type TuiInteract = crate::data::InteractGeneric<Option<InteractTag>>;
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sizes {
+    pub cell_size: Size,
+    pub pix_size: Size,
+}
+impl Sizes {
+    pub fn font_size(self) -> Size {
+        let Self {
+            cell_size: Size { w, h },
+            pix_size: Size { w: pw, h: ph },
+        } = self;
+        Size {
+            w: pw / w,
+            h: ph / h,
+        }
+    }
+    pub fn query() -> anyhow::Result<Self> {
+        let crossterm::terminal::WindowSize {
+            rows,
+            columns,
+            width,
+            height,
+        } = crossterm::terminal::window_size()?;
+        if width == 0 || height == 0 {
+            anyhow::bail!("Terminal does not support window_size");
+        }
+        Ok(Self {
+            cell_size: Size {
+                w: columns,
+                h: rows,
+            },
+            pix_size: Size {
+                w: width,
+                h: height,
+            },
+        })
+    }
+}
