@@ -55,27 +55,6 @@ impl Size {
     pub fn get(mut self, axis: Axis) -> u16 {
         *self.get_mut(axis)
     }
-    pub fn query_term_size() -> std::io::Result<Self> {
-        let (w, h) = crossterm::terminal::size()?;
-        Ok(Self { w, h })
-    }
-    /// Assumes raw mode
-    pub fn query_font_size() -> anyhow::Result<Self> {
-        use std::io::{BufRead, BufReader, Write};
-
-        print!("\x1b[16t");
-        std::io::stdout().flush().unwrap();
-        let mut input = Vec::new();
-        BufReader::new(std::io::stdin()).read_until(b't', &mut input)?;
-        let input = String::from_utf8(input)?;
-        // `\e[6;<height>;<width>t`
-        let trimmed = input.trim_start_matches("\x1b[6;").trim_end_matches('t');
-        let mut parts = trimmed.split(';').map(str::parse);
-        let (Some(Ok(h)), Some(Ok(w))) = (parts.next(), parts.next()) else {
-            anyhow::bail!("Malformed terminal response");
-        };
-        Ok(Self { w, h })
-    }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Axis {

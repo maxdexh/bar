@@ -3,17 +3,22 @@ use std::{
     ffi::{OsStr, OsString},
     os::unix::ffi::OsStrExt,
     sync::Arc,
+    time::Duration,
 };
 
+use anyhow::Context;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle, time::FutureExt as _};
 
 use crate::{
     tui,
-    utils::{Emit, SharedEmit, ubchan},
+    utils::{Emit, ResultExt, SharedEmit, unb_chan, unb_rx_stream},
 };
 
+// TODO: Consider using uuids
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TermId(Arc<[u8]>);
 impl TermId {
@@ -48,173 +53,199 @@ pub enum TermEvent {
     Sizes(tui::Sizes),
 }
 #[derive(Debug)]
-pub enum TermMgrUpdate<E> {
-    TermUpdate(Vec<TermId>, TermUpdate),
-    SpawnPanel(SpawnTerm<E>),
+pub enum TermMgrUpdate {
+    TermUpdate(TermId, TermUpdate),
+    SpawnPanel(SpawnTerm),
 }
 #[derive(Debug)]
-pub struct SpawnTerm<E> {
+pub struct SpawnTerm {
     pub term_id: TermId,
     pub extra_args: Vec<OsString>,
     pub extra_envs: Vec<(OsString, OsString)>,
-    pub event_tx: E,
+    pub term_ev_tx: tokio::sync::mpsc::UnboundedSender<TermEvent>,
 }
 
 pub const INTERNAL_ARG: &str = "internal-managed-terminal";
 
-#[derive(Debug)]
-enum MgrUpdMerge<E> {
-    Mgr(TermMgrUpdate<E>),
-    OnStop(TermId, u64),
+struct TermInst {
+    upd_tx: tokio::sync::mpsc::UnboundedSender<TermUpdate>,
+    cancel: CancellationToken,
 }
-pub async fn run_term_manager<E: SharedEmit<TermEvent>>(
-    updates: impl futures::Stream<Item = TermMgrUpdate<E>> + Send + 'static,
-) {
+
+pub async fn run_term_manager(updates: impl Stream<Item = TermMgrUpdate> + Send + 'static) {
     tokio::pin!(updates);
 
-    struct Term {
-        upd_tx: mpsc::UnboundedSender<Arc<TermUpdate>>,
-        internal_id: u64,
-        child: tokio::process::Child,
-        task: tokio::task::AbortHandle,
-    }
     let mut terminals = HashMap::new();
 
-    let mut tasks = JoinSet::new();
-
-    let mut next_internal_id = 0u64;
-    let mut next_internal_id = || {
-        next_internal_id += 1;
-        next_internal_id
-    };
+    let mut tasks = JoinSet::<()>::new();
 
     loop {
         let update = tokio::select! {
-            Some(upd) = updates.next() => MgrUpdMerge::Mgr(upd),
-            Some(res) = tasks.join_next() => match res {
-                Ok(upd) => upd,
-                Err(err) => {
-                    log::error!("Error joining task: {err}");
-                    continue;
+            Some(upd) = updates.next() => upd,
+            Some(res) = tasks.join_next() => {
+                if let Err(err) = res {
+                    log::error!("Error with task: {err}");
                 }
+                continue
             },
-            else => return,
+            else => break,
         };
         match update {
-            MgrUpdMerge::Mgr(TermMgrUpdate::TermUpdate(tids, tupd)) => {
-                let tupd = Arc::new(tupd);
-                for tid in tids {
-                    let Some(Term { upd_tx, .. }) = terminals.get(&tid) else {
-                        log::error!("Unknown terminal id {:?}", tid);
-                        continue;
-                    };
-                    if let TermUpdate::Shutdown = &*tupd {
-                        // TODO: Timeout then kill
-                    }
-                    if let Err(err) = upd_tx.send(tupd.clone()) {
-                        // TODO: Kill
-                    }
-                }
-            }
-            MgrUpdMerge::Mgr(TermMgrUpdate::SpawnPanel(SpawnTerm {
-                term_id,
-                extra_args,
-                extra_envs,
-                event_tx,
-            })) => {
-                let (upd_tx, mut upd_rx) = mpsc::unbounded_channel();
-
-                let init_res = (|| {
-                    let tmpdir = tempfile::tempdir()?;
-                    let sock_path = tmpdir.path().join("term-updates.sock");
-                    let listener = tokio::net::UnixListener::bind(&sock_path)?;
-                    // TODO: Set stdout
-                    let child = tokio::process::Command::new("kitten")
-                        .arg("panel")
-                        .args(extra_args)
-                        .arg(std::env::current_exe()?)
-                        .arg(INTERNAL_ARG)
-                        .envs(extra_envs)
-                        .env(SOCK_PATH_VAR, sock_path)
-                        .env(TERM_ID_VAR, OsStr::from_bytes(term_id.as_bytes()))
-                        .kill_on_drop(true)
-                        .stdout(std::io::stderr())
-                        .spawn()?;
-                    Ok::<_, anyhow::Error>((tmpdir, listener, child))
-                })();
-                let Ok((tmpdir, listener, child)) =
-                    init_res.map_err(|err| log::error!("Failed to spawn panel: {err}"))
-                else {
+            TermMgrUpdate::TermUpdate(tid, tupd) => {
+                let Some(TermInst { upd_tx, cancel }) = terminals.get_mut(&tid) else {
+                    log::error!(
+                        "Cannot send update {tupd:?} to unknown terminal id {:?}",
+                        tid
+                    );
                     continue;
                 };
-                let internal_id = next_internal_id();
-
-                let task = tasks.spawn({
-                    let term_id = term_id.clone();
-                    async move {
-                        let res = run_term_controller(
-                            tmpdir,
-                            listener,
-                            event_tx,
-                            futures::stream::poll_fn(move |cx| upd_rx.poll_recv(cx)),
-                        )
-                        .await;
-
-                        if let Err(err) = res {
-                            log::error!("Terminal failed: {err}");
-                        }
-
-                        MgrUpdMerge::OnStop(term_id, internal_id)
-                    }
-                });
-                if let Some(old) = terminals.insert(
-                    term_id,
-                    Term {
-                        upd_tx,
-                        internal_id,
-                        child,
-                        task,
-                    },
-                ) {
-                    todo!()
+                let is_shutdown = matches!(&tupd, TermUpdate::Shutdown);
+                if upd_tx.emit(tupd).is_break() || is_shutdown {
+                    cancel.cancel();
+                    terminals.remove(&tid);
                 }
             }
-            MgrUpdMerge::OnStop(term_id, internal_id) => todo!(),
+            TermMgrUpdate::SpawnPanel(spawn) => {
+                let term_id = spawn.term_id.clone();
+
+                let (upd_tx, upd_rx) = tokio::sync::mpsc::unbounded_channel();
+                let cancel_inst = CancellationToken::new();
+                if let Some(()) =
+                    spawn_inst(spawn, unb_rx_stream(upd_rx), cancel_inst.clone()).ok_or_log()
+                {
+                    let old = terminals.insert(
+                        term_id,
+                        TermInst {
+                            upd_tx,
+                            cancel: cancel_inst,
+                        },
+                    );
+                    if let Some(old) = old {
+                        old.cancel.cancel();
+                    }
+                }
+            }
         }
     }
 }
-
-const SOCK_PATH_VAR: &str = "BAR_TERM_INSTANCE_SOCK_PATH";
-const TERM_ID_VAR: &str = "BAR_TERM_INSTANCE_ID";
-
-async fn run_term_controller(
-    _tmpdir_guard: tempfile::TempDir,
-    listener: tokio::net::UnixListener,
-    ev_tx: impl SharedEmit<TermEvent>,
-    updates: impl futures::Stream<Item = Arc<TermUpdate>> + Send + 'static,
+fn spawn_inst(
+    SpawnTerm {
+        term_id,
+        extra_args,
+        extra_envs,
+        term_ev_tx,
+    }: SpawnTerm,
+    upd_rx: impl Stream<Item = TermUpdate> + 'static + Send,
+    inst_tok: CancellationToken,
 ) -> anyhow::Result<()> {
-    let mut tasks = JoinSet::new();
-    // TODO: Await stream
+    let tmpdir = tempfile::tempdir()?;
+    let sock_path = tmpdir.path().join("term-updates.sock");
+    let socket = tokio::net::UnixListener::bind(&sock_path)?;
+    let mut child = tokio::process::Command::new("kitten")
+        .arg("panel")
+        .args(extra_args)
+        .arg(std::env::current_exe()?)
+        .arg(INTERNAL_ARG)
+        .envs(extra_envs)
+        .env(SOCK_PATH_VAR, sock_path)
+        .env(TERM_ID_VAR, OsStr::from_bytes(term_id.as_bytes()))
+        .kill_on_drop(true)
+        .stdout(std::io::stderr())
+        .spawn()?;
 
-    let (socket, _) = listener.accept().await?;
-    let (read_half, write_half) = socket.into_split();
-
-    tasks.spawn(read_cobs_sock::<TermEvent>(read_half, ev_tx));
-    tasks.spawn(write_cobs_sock::<Arc<TermUpdate>>(write_half, updates));
-
-    if let Some(Err(err)) = tasks.join_next().await {
-        log::error!("Error with task: {err}");
-    }
+    let mgr = AbortOnDropHandle::new({
+        let inst_tok = inst_tok.clone();
+        tokio::spawn(async move {
+            run_term_inst_mgr(socket, term_ev_tx, upd_rx, inst_tok.clone())
+                .await
+                .context("Terminal instance failed")
+                .ok_or_log();
+            inst_tok.cancel();
+        })
+    });
+    tokio::spawn(async move {
+        tokio::select! {
+            exit_res = child.wait() => {
+                inst_tok.cancel();
+                if let Err(err) = exit_res.context("Failed to wait for terminal exit") {
+                    log::error!("{err:?}");
+                    _ = child.kill().await;
+                }
+            }
+            () = inst_tok.cancelled() => {
+                let res = child.wait().timeout(Duration::from_secs(10)).await;
+                let res: anyhow::Result<_> = (|| Ok(res??))();
+                if let Err(err) = res.context("Terminal instance failed to exit after shutdown") {
+                    log::error!("{err:?}");
+                }
+            }
+        };
+        mgr.abort();
+        drop(tmpdir);
+    });
 
     Ok(())
 }
 
-pub async fn term_proc_main() -> anyhow::Result<()> {
-    let Some(term_id) = std::env::var_os(TERM_ID_VAR) else {
-        anyhow::bail!("Missing term id env var");
-    };
-    let term_id = TermId::from_bytes(term_id.as_bytes());
-    log::info!("Term process {term_id:?} started");
+const SOCK_PATH_VAR: &str = "BAR_TERM_INSTANCE_SOCK_PATH";
+pub const TERM_ID_VAR: &str = "BAR_TERM_INSTANCE_ID";
+
+async fn run_term_inst_mgr(
+    socket: tokio::net::UnixListener,
+    ev_tx: impl SharedEmit<TermEvent>,
+    updates: impl Stream<Item = TermUpdate> + Send + 'static,
+    inst_cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let mut tasks = JoinSet::<Option<()>>::new();
+    // TODO: Await stream
+
+    let (socket, _) = socket
+        .accept()
+        .timeout(Duration::from_secs(5))
+        .await
+        .context("Timed out while accepting socket connection")?
+        .context("Failed to accept socket connection")?;
+    let (read_half, write_half) = socket.into_split();
+
+    tasks.spawn(
+        read_cobs_sock::<TermEvent>(read_half, ev_tx, inst_cancel.clone())
+            .with_cancellation_token_owned(inst_cancel.clone()),
+    );
+    tasks.spawn(
+        write_cobs_sock::<TermUpdate>(write_half, updates, inst_cancel.clone())
+            .with_cancellation_token_owned(inst_cancel.clone()),
+    );
+
+    if let Some(Err(err)) = tasks.join_next().await {
+        log::error!("Error with task: {err}");
+    }
+    inst_cancel.cancel();
+    tasks.join_all().await;
+
+    Ok(())
+}
+
+pub async fn term_proc_main(term_id: TermId) {
+    term_proc_main_inner(term_id).await.ok_or_log();
+}
+
+async fn term_proc_main_inner(term_id: TermId) -> anyhow::Result<()> {
+    let proc_tok = CancellationToken::new();
+    let (mut ev_tx, upd_rx);
+    {
+        let socket = std::env::var_os(SOCK_PATH_VAR).context("Missing socket path env var")?;
+        let socket = tokio::net::UnixStream::connect(socket)
+            .await
+            .context("Failed to connect to socket")?;
+        let (read, write) = socket.into_split();
+
+        let (upd_tx, ev_rx);
+        (ev_tx, ev_rx) = unb_chan::<TermEvent>();
+        (upd_tx, upd_rx) = std::sync::mpsc::channel::<TermUpdate>();
+
+        tokio::spawn(read_cobs_sock(read, upd_tx, proc_tok.clone()));
+        tokio::spawn(write_cobs_sock(write, ev_rx, proc_tok.clone()));
+    }
 
     crossterm::execute!(
         std::io::stdout(),
@@ -224,26 +255,13 @@ pub async fn term_proc_main() -> anyhow::Result<()> {
     )?;
     crossterm::terminal::enable_raw_mode()?;
 
-    let mut tasks = JoinSet::new();
-    let (mut ev_tx, upd_rx);
-    {
-        let socket = std::env::var_os(SOCK_PATH_VAR).ok_or(std::env::VarError::NotPresent)?;
-        let socket = tokio::net::UnixStream::connect(socket).await?;
-        let (read, write) = socket.into_split();
-
-        let (upd_tx, ev_rx);
-        (ev_tx, ev_rx) = ubchan::<TermEvent>();
-        (upd_tx, upd_rx) = std::sync::mpsc::channel::<TermUpdate>();
-        tasks.spawn(read_cobs_sock(read, upd_tx));
-        tasks.spawn(write_cobs_sock(write, ev_rx));
-    }
-
     let init_sizes = tui::Sizes::query()?;
+
     if ev_tx.emit(TermEvent::Sizes(init_sizes)).is_break() {
         anyhow::bail!("Failed to send initial font size while starting {term_id:?}. Exiting.");
     }
 
-    tasks.spawn(async move {
+    tokio::spawn(async move {
         let mut events = crossterm::event::EventStream::new();
         while let Some(ev) = events.next().await {
             match ev {
@@ -319,9 +337,7 @@ pub async fn term_proc_main() -> anyhow::Result<()> {
         }
     });
 
-    if let Some(Err(err)) = tasks.join_next().await {
-        log::error!("{err}");
-    }
+    proc_tok.cancelled().await;
 
     Ok(())
 }
@@ -329,7 +345,10 @@ pub async fn term_proc_main() -> anyhow::Result<()> {
 async fn read_cobs_sock<T: serde::de::DeserializeOwned>(
     read: tokio::net::unix::OwnedReadHalf,
     mut tx: impl SharedEmit<T>,
+    on_disonnect: CancellationToken,
 ) {
+    let _auto_cancel = on_disonnect.drop_guard();
+
     use tokio::io::AsyncBufReadExt as _;
     let mut read = tokio::io::BufReader::new(read);
     loop {
@@ -363,8 +382,11 @@ async fn read_cobs_sock<T: serde::de::DeserializeOwned>(
 
 async fn write_cobs_sock<T: Serialize>(
     mut write: tokio::net::unix::OwnedWriteHalf,
-    stream: impl futures::Stream<Item = T>,
+    stream: impl Stream<Item = T>,
+    on_disonnect: CancellationToken,
 ) {
+    let _auto_cancel = on_disonnect.drop_guard();
+
     use tokio::io::AsyncWriteExt as _;
     tokio::pin!(stream);
     while let Some(item) = stream.next().await {

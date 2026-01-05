@@ -3,10 +3,7 @@ use std::sync::Arc;
 // TODO: aarc?
 // TODO: ElementKind that maps monitor to element
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(transparent)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InteractTag(Arc<[u8]>);
 impl InteractTag {
     pub fn as_bytes(&self) -> &[u8] {
@@ -25,7 +22,7 @@ impl std::fmt::Debug for InteractTag {
     }
 }
 
-#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+#[derive(Default, Debug)]
 pub enum Elem {
     Subdivide(Stack),
     Text(Text),
@@ -61,20 +58,58 @@ impl From<Text> for Elem {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Text {
-    pub text: Arc<str>,
+#[derive(Debug)]
+pub struct TextLine {
+    pub text: String,
+    /// The height of the line. Relevant for the text sizing and graphics protocols.
+    /// Only used for layout calculations, including determining where the next line is printed in
+    /// a [`Text`] element.
+    pub height: u16,
+    pub style: Style,
 }
-impl Text {
-    pub fn plain(body: Arc<str>) -> Self {
-        if body.contains('\x1b') {
-            log::warn!("Call to `plain` with text containing <ESC>: {body:?}");
+impl TextLine {
+    pub fn plain(text: String) -> Self {
+        if text.contains(['\n', '\x1b']) {
+            log::warn!("Plain text line {text:?} should not contain <ESC> or newlines.");
         }
-        Self { text: body }
+        Self {
+            text,
+            height: 1,
+            style: Default::default(),
+        }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug)]
+pub struct Text {
+    pub lines: Vec<TextLine>,
+    /// The width of the longest line in cells. Only used for layout calculations.
+    /// Each line is printed as-is, regardless of this value.
+    pub width: u16,
+}
+impl Text {
+    pub fn plain(text: impl AsRef<str>) -> Self {
+        let text = text.as_ref();
+        if text.contains('\x1b') {
+            log::warn!("Plain text {text:?} should not contain <ESC>.");
+        }
+        let mut lines = Vec::with_capacity(text.lines().count());
+        let mut width = 0u16;
+        for line in text.lines() {
+            width = std::cmp::max(width, line.chars().count().try_into().unwrap_or(u16::MAX));
+            lines.push(TextLine::plain(line.into()));
+        }
+        Self { lines, width }
+    }
+    pub fn style(mut self, style: Style) -> Self {
+        for line in &mut self.lines {
+            line.style = style;
+        }
+        self
+    }
+}
+
+#[derive(Debug)]
 pub struct TagElem {
     pub tag: InteractTag,
     pub elem: Elem,
@@ -88,11 +123,9 @@ impl TagElem {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
 pub struct Image {
     pub data: Vec<u8>,
     pub format: image::ImageFormat,
-    #[serde(skip)]
     pub cached: Option<image::RgbaImage>,
 }
 impl std::fmt::Debug for Image {
@@ -116,7 +149,7 @@ impl Image {
         Ok(self.cached.insert(img.into_rgba8()))
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct Block {
     pub borders: Borders,
     pub border_style: Style,
@@ -124,7 +157,7 @@ pub struct Block {
     pub inner: Option<Box<Elem>>,
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Borders {
     pub top: bool,
     pub bottom: bool,
@@ -142,15 +175,14 @@ impl Borders {
     }
 }
 
-#[derive(Default, Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Default, Clone, Copy, Debug)]
 pub enum Constr {
     Length(u16),
-    // FIXME: Remove, to make the precalculated size absolute. Use cursor movement for bar sides
     Fill(u16),
     #[default]
     Auto,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct Stack {
     pub axis: Axis,
     pub parts: Box<[StackItem]>,
@@ -170,7 +202,7 @@ impl Stack {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct StackItem {
     pub constr: Constr,
     pub elem: Elem,
@@ -194,42 +226,20 @@ impl StackItem {
 }
 
 // TODO: Tagging system for partial updates?
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct Tui {
-    pub root: Elem,
+    pub root: Box<Elem>,
 }
 
-#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct Style {
     pub fg: Option<Color>,
     pub bg: Option<Color>,
     pub modifier: Modifier,
     pub underline_color: Option<Color>,
 }
-#[derive(Clone, Copy, Default, Debug, Serialize, Deserialize)]
-pub enum Color {
-    #[default]
-    Reset,
-    Black,
-    Red,
-    Green,
-    Yellow,
-    Blue,
-    Magenta,
-    Cyan,
-    Gray,
-    DarkGray,
-    LightRed,
-    LightGreen,
-    LightYellow,
-    LightBlue,
-    LightMagenta,
-    LightCyan,
-    White,
-    Rgb(u8, u8, u8),
-    Indexed(u8),
-}
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub type Color = crossterm::style::Color;
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Modifier {
     pub bold: bool,
     pub dim: bool,
@@ -239,7 +249,7 @@ pub struct Modifier {
     pub strike: bool,
 }
 
-#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+#[derive(Default, Debug)]
 pub struct LineSet {
     pub vertical: Box<str>,
     pub horizontal: Box<str>,
@@ -247,11 +257,6 @@ pub struct LineSet {
     pub top_left: Box<str>,
     pub bottom_right: Box<str>,
     pub bottom_left: Box<str>,
-    pub vertical_left: Box<str>,
-    pub vertical_right: Box<str>,
-    pub horizontal_down: Box<str>,
-    pub horizontal_up: Box<str>,
-    pub cross: Box<str>,
 }
 
 impl LineSet {
@@ -263,11 +268,6 @@ impl LineSet {
             top_left: "┌".into(),
             bottom_right: "┘".into(),
             bottom_left: "└".into(),
-            vertical_left: "┤".into(),
-            vertical_right: "├".into(),
-            horizontal_down: "┬".into(),
-            horizontal_up: "┴".into(),
-            cross: "┼".into(),
         }
     }
 
@@ -291,11 +291,6 @@ impl LineSet {
             top_left: "╔".into(),
             bottom_right: "╝".into(),
             bottom_left: "╚".into(),
-            vertical_left: "╣".into(),
-            vertical_right: "╠".into(),
-            horizontal_down: "╦".into(),
-            horizontal_up: "╩".into(),
-            cross: "╬".into(),
         }
     }
 
@@ -307,11 +302,6 @@ impl LineSet {
             top_left: "┏".into(),
             bottom_right: "┛".into(),
             bottom_left: "┗".into(),
-            vertical_left: "┫".into(),
-            vertical_right: "┣".into(),
-            horizontal_down: "┳".into(),
-            horizontal_up: "┻".into(),
-            cross: "╋".into(),
         }
     }
 

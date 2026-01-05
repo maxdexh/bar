@@ -2,7 +2,7 @@ use std::io::Write;
 
 use crate::tui::*;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug)]
 pub struct SizingContext {
     pub font_size: Size,
     pub div_w: Option<u16>,
@@ -300,15 +300,12 @@ impl Stack {
 // TODO: Styling (using crossterm)
 impl Text {
     pub fn calc_auto_size(&mut self, sizing: SizingContext) -> anyhow::Result<Size> {
+        // TODO: Warn if text is too large
         auto_size_invariants(sizing, || {
-            let mut size = Size::default();
-            for line in self.text.lines() {
-                size.w = size
-                    .w
-                    .max(line.chars().count().try_into().unwrap_or(u16::MAX));
-                size.h = size.h.saturating_add(1);
-            }
-            Ok(size)
+            Ok(Size {
+                w: self.width,
+                h: self.lines.iter().map(|line| line.height).sum(),
+            })
         })
     }
     fn render(
@@ -317,16 +314,23 @@ impl Text {
         _: SizingContext,
         area: Area,
     ) -> std::io::Result<()> {
-        for (y_off, line) in self.text.lines().enumerate() {
-            let Ok(y) = u16::try_from(usize::from(area.pos.y) + y_off) else {
+        let mut y_off = 0;
+        // TODO: Style
+        for line in &self.lines {
+            let Some(y) = area.pos.y.checked_add(y_off) else {
                 log::error!("Vertical position overflow");
                 break;
             };
             crossterm::queue!(
                 ctx.writer,
                 crossterm::cursor::MoveTo(area.pos.x, y),
-                crossterm::style::Print(line),
+                crossterm::style::Print(stylize(line.text.as_str(), line.style)),
             )?;
+            let Some(new_y_off) = y_off.checked_add(line.height) else {
+                log::error!("Vertical position overflow");
+                break;
+            };
+            y_off = new_y_off;
         }
 
         Ok(())
@@ -370,7 +374,6 @@ impl Block {
             Ok(size)
         })
     }
-    // FIXME: Implement styling (crossterm)
     fn render(
         &mut self,
         ctx: &mut RenderCtx<impl Write>,
@@ -407,21 +410,23 @@ impl Block {
         }
 
         let mut horiz_border = |l: &str, r: &str, y: u16| {
-            let l = if left { l } else { "" };
-            let r = if right { r } else { "" };
-            let m = self.border_set.horizontal.repeat(
-                area.size
-                    .w
-                    .saturating_sub(left.into())
-                    .saturating_sub(right.into())
-                    .into(),
+            let m = stylize(
+                self.border_set.horizontal.repeat(
+                    area.size
+                        .w
+                        .saturating_sub(left.into())
+                        .saturating_sub(right.into())
+                        .into(),
+                ),
+                self.border_style,
             );
+            let l = stylize(if left { l } else { "" }, self.border_style);
+            let r = stylize(if right { r } else { "" }, self.border_style);
+
             crossterm::queue!(
                 ctx.writer,
                 crossterm::cursor::MoveTo(area.pos.x, y),
-                crossterm::style::Print(l),
-                crossterm::style::Print(m),
-                crossterm::style::Print(r),
+                crossterm::style::Print(format_args!("{l}{m}{r}")),
             )
         };
         if top {
@@ -449,7 +454,10 @@ impl Block {
                 crossterm::queue!(
                     ctx.writer,
                     crossterm::cursor::MoveTo(x, y),
-                    crossterm::style::Print(&self.border_set.vertical),
+                    crossterm::style::Print(stylize(
+                        &self.border_set.vertical as &str,
+                        self.border_style
+                    )),
                 )?;
             }
             Ok(())
@@ -480,27 +488,62 @@ fn auto_size_invariants(
     }
     Ok(size)
 }
+fn stylize<S>(
+    s: S,
+    Style {
+        fg,
+        bg,
+        modifier:
+            Modifier {
+                bold,
+                dim,
+                italic,
+                underline,
+                hidden,
+                strike,
+            },
+        underline_color,
+    }: Style,
+) -> S::Styled
+where
+    S: crossterm::style::Stylize<
+            Styled: crossterm::style::Stylize<Styled = S::Styled> + std::fmt::Display,
+        >,
+{
+    use crossterm::style::Stylize;
 
-pub fn draw(
-    doit: impl FnOnce(
-        &mut RenderCtx<std::io::BufWriter<std::io::StdoutLock<'static>>>,
-    ) -> std::io::Result<()>,
-) -> std::io::Result<RenderedLayout> {
-    let mut layout = Default::default();
-    let mut writer = std::io::BufWriter::new(std::io::stdout().lock());
-    let mut ctx = RenderCtx {
-        layout: &mut layout,
-        writer: &mut writer,
-    };
-    crossterm::queue!(
-        ctx.writer,
-        crossterm::terminal::BeginSynchronizedUpdate,
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-    )?;
-    doit(&mut ctx)?;
-    crossterm::execute!(ctx.writer, crossterm::terminal::EndSynchronizedUpdate)?;
-    Ok(layout)
+    let mut s = s.stylize();
+    if bold {
+        s = s.bold();
+    }
+    if dim {
+        s = s.dim();
+    }
+    if italic {
+        s = s.italic();
+    }
+    if underline {
+        s = s.underlined();
+    }
+    if hidden {
+        s = s.hidden();
+    }
+    if strike {
+        s = s.crossed_out();
+    }
+    if let Some(fg) = fg {
+        s = s.with(fg);
+    }
+    if let Some(bg) = bg {
+        s = s.on(bg);
+    }
+    if let Some(col) = underline_color {
+        s = s.underline(col);
+    }
+
+    s
 }
+
 pub fn draw_to<W: std::io::Write>(
     writer: &mut W,
     doit: impl FnOnce(&mut RenderCtx<W>) -> std::io::Result<()>,

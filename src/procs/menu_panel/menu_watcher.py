@@ -10,5 +10,5 @@ def on_focus_change(boss, window, data):
         client.sendall(b"\0")
 
 
-def on_resize(boss, window, data):
-    client.sendall(b"\1")
+# def on_resize(boss, window, data):
+#    client.sendall(b"\1")

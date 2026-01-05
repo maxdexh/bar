@@ -5,25 +5,25 @@ use futures::Stream;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt as _;
 
-use crate::utils::{ReloadRx, broadcast_stream};
+use crate::utils::{ReloadRx, SharedEmit, lossy_broadcast};
 
 pub fn connect(reload_rx: ReloadRx) -> (broadcast::Sender<()>, impl Stream<Item = Arc<str>>) {
     let (switch_tx, switch_rx) = broadcast::channel(50);
     let (profile_tx, profile_rx) = broadcast::channel(50);
 
     tokio::spawn(async move {
-        match run(profile_tx, broadcast_stream(switch_rx), reload_rx).await {
+        match run(profile_tx, lossy_broadcast(switch_rx), reload_rx).await {
             Err(err) => log::error!("Failed to connect to ppd: {err}"),
             Ok(()) => log::warn!("Ppd client exited"),
         }
     });
 
-    (switch_tx, broadcast_stream(profile_rx))
+    (switch_tx, lossy_broadcast(profile_rx))
 }
 
 async fn run(
-    profile_tx: broadcast::Sender<Arc<str>>,
-    switches: impl Stream<Item = ()>,
+    mut profile_tx: impl SharedEmit<Arc<str>>,
+    switch_rx: impl Stream<Item = ()>,
     reload_rx: ReloadRx,
 ) -> Result<()> {
     let connection = zbus::Connection::system().await?;
@@ -45,7 +45,7 @@ async fn run(
         },
     );
     let updates = active_profiles
-        .merge(switches.map(Upd::CycleProfile))
+        .merge(switch_rx.map(Upd::CycleProfile))
         .merge(reload_rx.into_stream().map(Upd::Reload));
     tokio::pin!(updates);
 
@@ -55,14 +55,12 @@ async fn run(
             Upd::ProfileChanged(profile) => {
                 cur_profile = profile;
 
-                if let Err(err) = profile_tx.send(cur_profile.clone()) {
-                    log::warn!("Failed to send profile: {err}");
+                if profile_tx.emit(cur_profile.clone()).is_break() {
                     break;
                 }
             }
             Upd::Reload(()) => {
-                if let Err(err) = profile_tx.send(cur_profile.clone()) {
-                    log::warn!("Failed to send profile: {err}");
+                if profile_tx.emit(cur_profile.clone()).is_break() {
                     break;
                 }
             }

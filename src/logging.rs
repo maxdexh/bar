@@ -8,15 +8,13 @@ pub fn should_color() -> bool {
 #[derive(Debug)]
 pub enum ProcKindForLogger {
     Controller,
-    Bar(String),
-    Menu(String),
+    Panel(crate::terminals::TermId),
 }
 impl std::fmt::Display for ProcKindForLogger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Controller => write!(f, "CONTROLLER"),
-            Self::Bar(display) => write!(f, "BAR @ {display}"),
-            Self::Menu(display) => write!(f, "MENU @ {display}"),
+            Self::Panel(id) => write!(f, "{id:?}"),
         }
     }
 }

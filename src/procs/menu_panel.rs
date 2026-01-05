@@ -1,146 +1,43 @@
-use std::{ffi::OsString, sync::Arc};
+use std::{collections::HashMap, ffi::OsString, ops::ControlFlow, sync::Arc, time::Duration};
 
-use anyhow::anyhow;
+use anyhow::Context as _;
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use system_tray::item::Tooltip;
-use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
+use tokio_util::time::FutureExt as _;
 
 use crate::{
-    clients::tray::{TrayMenuExt, TrayMenuInteract},
-    data::{ActiveMonitorInfo, Position32},
+    clients::{
+        monitors::{MonitorEvent, MonitorInfo},
+        tray::{TrayMenuExt, TrayMenuInteract},
+    },
+    data::Position32,
+    terminals::{SpawnTerm, TermEvent, TermId, TermMgrUpdate, TermUpdate},
     tui,
+    utils::{Emit, ResultExt as _, SharedEmit, unb_chan, unb_rx_stream},
 };
-
-pub async fn controller_spawn_panel(
-    dir: &std::path::Path,
-    display: &str,
-    envs: Vec<(OsString, OsString)>,
-    ev_tx: &tokio::sync::mpsc::UnboundedSender<MenuEvent>,
-) -> anyhow::Result<tokio::process::Child> {
-    let watcher_py = dir.join("menu_watcher.py");
-    tokio::fs::write(&watcher_py, include_bytes!("menu_panel/menu_watcher.py")).await?;
-
-    let watcher_sock_path = dir.join("menu_watcher.sock");
-
-    // FIXME: Consider opening the socket in the watcher instead?
-    // Then we could move the socket into the menu.
-    let watcher_listener = tokio::net::UnixListener::bind(&watcher_sock_path)?;
-
-    let child = tokio::process::Command::new("kitten")
-        .stdout(std::io::stderr())
-        .envs(envs)
-        .env("BAR_MENU_WATCHER_SOCK", watcher_sock_path)
-        .arg("panel")
-        .arg({
-            let mut arg = OsString::from("-o=watcher=");
-            arg.push(watcher_py);
-            arg
-        })
-        .args([
-            &format!("--output-name={display}"),
-            // Configure remote control via socket
-            "-o=allow_remote_control=socket-only",
-            "--listen-on=unix:/tmp/kitty-bar-menu-panel.sock",
-            // Allow logging to $KITTY_STDIO_FORWARDED
-            "-o=forward_stdio=yes",
-            // Do not use the system's kitty.conf
-            "--config=NONE",
-            // Basic look of the menu
-            "-o=background_opacity=0.85",
-            "-o=background=black",
-            "-o=foreground=white",
-            // location of the menu
-            "--edge=top",
-            // disable hiding the mouse
-            "-o=mouse_hide_wait=0",
-            // Window behavior of the menu panel. Makes panel
-            // act as an overlay on top of other windows.
-            // We do not want tilers to dedicate space to it.
-            // Taken from the args that quick-access-terminal uses.
-            "--exclusive-zone=0",
-            "--override-exclusive-zone",
-            "--layer=overlay",
-            // Focus behavior of the panel. Since we cannot tell from
-            // mouse events alone when the cursor leaves the panel
-            // (since terminal mouse capture only gives us mouse
-            // events inside the panel), we need external support for
-            // hiding it automatically. We use a watcher to be able
-            // to reset the menu state when this happens.
-            "--focus-policy=on-demand",
-            "--hide-on-focus-loss",
-            // Since we control resizes from the program and not from
-            // a somewhat continuous drag-resize, debouncing between
-            // resize and reloads is completely inappropriate and
-            // just results in a larger delay between resize and
-            // the old menu content being replaced with the new one.
-            "-o=resize_debounce_time=0 0",
-            // TODO: Mess with repaint_delay, input_delay
-        ])
-        .arg(&std::env::current_exe()?)
-        .args(["internal", super::INTERNAL_MENU_ARG])
-        .kill_on_drop(true)
-        .spawn()?;
-
-    let (mut watcher_stream, _) = watcher_listener.accept().await?;
-    let ev_tx = ev_tx.clone();
-    tokio::spawn(async move {
-        use tokio::io::AsyncReadExt;
-        loop {
-            let Ok(it) = watcher_stream
-                .read_u8()
-                .await
-                .map_err(|err| log::error!("Failed to read from watcher stream: {err}"))
-            else {
-                break;
-            };
-            let parsed = match it {
-                0 => MenuWatcherEvent::Hide,
-                1 => MenuWatcherEvent::Resize,
-                _ => {
-                    log::error!("Unknown event");
-                    continue;
-                }
-            };
-
-            if let Err(err) = ev_tx.send(MenuEvent::Watcher(parsed)) {
-                log::warn!("Failed to send watcher event: {err}");
-                break;
-            }
-        }
-    });
-
-    Ok(child)
-}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum MenuEvent {
     Interact(Interact),
-    Watcher(MenuWatcherEvent),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MenuWatcherEvent {
     Hide,
-    Resize,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum MenuUpdate {
-    Watcher(MenuWatcherEvent),
     UnfocusMenu,
+    Hide,
     SwitchSubject {
         new_menu: Menu,
         location: Position32,
+        monitor: Arc<str>,
     },
-    UpdateTrayMenu(Arc<str>, TrayMenuExt),
-    UpdateTrayTooltip(Arc<str>, Option<Tooltip>),
-    RemoveTray(Arc<str>),
-    ConnectTrayMenu {
-        addr: String,
-        menu_path: Option<String>,
-    },
-    ActiveMonitor(Option<ActiveMonitorInfo>),
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum MenuInteractTarget {
@@ -155,153 +52,23 @@ impl MenuInteractTarget {
     }
 }
 
+// FIXME: Send finished tui instead, do conversion in client
+// Also send extra info like close_on_unfocus/is_tooltip.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Menu {
     TrayContext { addr: Arc<str>, tmenu: TrayMenuExt },
     TrayTooltip { addr: Arc<str>, tooltip: Tooltip },
-    None,
 }
 impl Menu {
-    fn is_visible(&self) -> bool {
-        !matches!(self, Self::None)
-    }
-    fn close_on_unfocus(&self) -> Option<bool> {
-        Some(match self {
+    fn close_on_unfocus(&self) -> bool {
+        match self {
             Self::TrayTooltip { .. } => true,
             Self::TrayContext { .. } => false,
-            Self::None => return None,
-        })
+        }
     }
 }
 
 type Interact = crate::data::InteractGeneric<MenuInteractTarget>;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Geometry {
-    size: tui::Size,
-    location: Position32,
-    font_size: tui::Size,
-    monitor: Option<ActiveMonitorInfo>,
-}
-async fn adjust_terminal(
-    new_geo: &Geometry,
-    old_geo: &Geometry,
-    socket: &str,
-    menu_is_visible: bool,
-) -> anyhow::Result<bool> {
-    let &Geometry {
-        size: tui::Size {
-            w: width,
-            h: height,
-        },
-        location: Position32 { x, y: _ },
-        font_size: tui::Size { w: font_w, .. },
-        ref monitor,
-    } = new_geo;
-
-    let mut pending_resize = false;
-
-    async fn run_command(cmd: &mut tokio::process::Command) -> anyhow::Result<()> {
-        let output = cmd.stderr(std::process::Stdio::piped()).output().await?;
-        if !output.status.success() {
-            Err(anyhow!(
-                "{cmd:#?} Exited with status {:#?}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            ))
-        } else {
-            Ok(())
-        }
-    }
-
-    if menu_is_visible
-        && new_geo != old_geo
-        && let Some(monitor) = monitor
-    {
-        pending_resize = true;
-
-        log::trace!("Resizing terminal: {new_geo:#?}");
-
-        // NOTE: There is no absolute positioning system, nor a way to directly specify the
-        // geometry (since this is controlled by the compositor). So we have to get creative by
-        // using the right and left margin to control both position and size of the panel.
-
-        // cap position at monitor's size
-        let x = std::cmp::min(x, monitor.width);
-
-        // Find the distance between window edge and center
-        // HACK: The margin calculation is always slightly too small, so add a few cells to the
-        // calculation
-        // TODO: Find out if this needs to increase with the width or if the error is constant
-        // TODO: Try checking against crossterm::terminal::size and caching offset
-        let half_pix_w = (u32::from(width + 1) * u32::from(font_w)).div_ceil(2);
-
-        // The left margin should be such that half the space is between
-        // left margin and x. Use saturating_sub so that the left
-        // margin becomes zero if the width would reach outside the screen.
-        let mleft = x.saturating_sub(half_pix_w);
-
-        // Get the overshoot, i.e. the amount lost to saturating_sub (we have to account for it
-        // in the right margin). For this observe that a.saturating_sub(b) = a - min(a, b) and
-        // therefore the overshoot is:
-        // a.saturating_sub(b) - (a - b)
-        // = a - min(a, b) - (a - b)
-        // = b - min(a, b)
-        // = b.saturating_sub(a)
-        let overshoot = half_pix_w.saturating_sub(x);
-
-        let mright = (monitor.width - x)
-            .saturating_sub(half_pix_w)
-            .saturating_sub(overshoot);
-
-        // The font size (on which cell->pixel conversion is based) and the monitor's
-        // size are in physical pixels. This makes sense because different monitors can
-        // have different scales, and the application should not be affected by that
-        // (this is not x11 after all).
-        // However, panels are bound to a monitor and the margins are in scaled pixels,
-        // so we have to make this correction.
-        let margin_left = (f64::from(mleft) / monitor.scale) as u32;
-        let margin_right = (f64::from(mright) / monitor.scale) as u32;
-
-        // TODO: Timeout
-        run_command(
-            tokio::process::Command::new("kitten")
-                .args([
-                    "@",
-                    &format!("--to={socket}"),
-                    "resize-os-window",
-                    "--incremental",
-                    "--action=os-panel",
-                ])
-                .args({
-                    let args = [
-                        format!("margin-left={margin_left}"),
-                        format!("margin-right={margin_right}"),
-                        format!("lines={height}"),
-                    ];
-                    log::info!("Resizing menu: {args:?}");
-                    args
-                }),
-        )
-        .await?;
-    }
-
-    // TODO: Move to correct monitor
-    let action = if menu_is_visible && monitor.is_some() {
-        "show"
-    } else {
-        "hide"
-    };
-    run_command(tokio::process::Command::new("kitten").args([
-        "@",
-        &format!("--to={socket}"),
-        "resize-os-window",
-        &format!("--action={action}"),
-    ]))
-    .await?;
-
-    Ok(pending_resize)
-}
 
 fn tray_menu_item_to_tui(
     depth: u16,
@@ -322,7 +89,7 @@ fn tray_menu_item_to_tui(
                 ..Default::default()
             },
             border_style: tui::Style {
-                fg: Some(tui::Color::DarkGray),
+                fg: Some(tui::Color::DarkGrey),
                 ..Default::default()
             },
             border_set: tui::LineSet::normal(),
@@ -339,10 +106,10 @@ fn tray_menu_item_to_tui(
             icon_name: _,
             icon_data,
             shortcut: _,
-            toggle_type: _,  // TODO
-            toggle_state: _, // TODO
+            toggle_type: _, // TODO: implement toggle
+            toggle_state: _,
             children_display: _,
-            disposition: _, // TODO: ???
+            disposition: _, // TODO: what to do with this?
             submenu: _,
         } => {
             let elem = tui::Stack::horizontal([
@@ -360,13 +127,15 @@ fn tray_menu_item_to_tui(
                                     cached: None,
                                 }),
                                 tui::StackItem::spacing(1),
-                                tui::StackItem::auto(tui::Text::plain(first_line.into())),
+                                tui::StackItem::auto(tui::Text::plain(first_line)),
                             ]),
                         ),
-                        tui::StackItem::auto(tui::Text::plain(lines.collect::<String>().into())),
+                        tui::StackItem::auto(tui::Text::plain(
+                            lines.collect::<Vec<&str>>().join("\n"),
+                        )),
                     ]))
                 } else {
-                    tui::StackItem::auto(tui::Text::plain(label.as_str().into()))
+                    tui::StackItem::auto(tui::Text::plain(label))
                 },
                 tui::StackItem::spacing(1),
             ])
@@ -418,9 +187,8 @@ fn tray_menu_to_tui(
     .into()
 }
 
-pub fn to_tui(menu: &Menu) -> Option<tui::Tui> {
-    Some(match menu {
-        Menu::None => return None,
+pub fn to_tui(menu: &Menu) -> tui::Tui {
+    match menu {
         Menu::TrayContext {
             addr,
             tmenu:
@@ -432,21 +200,23 @@ pub fn to_tui(menu: &Menu) -> Option<tui::Tui> {
         } => {
             // Then render the items
             tui::Tui {
-                root: tui::Block {
-                    borders: tui::Borders::all(),
-                    border_style: tui::Style {
-                        fg: Some(tui::Color::DarkGray),
-                        ..Default::default()
-                    },
-                    border_set: tui::LineSet::thick(),
-                    inner: Some(Box::new(tray_menu_to_tui(
-                        0,
-                        submenus,
-                        addr,
-                        menu_path.as_ref(),
-                    ))),
-                }
-                .into(),
+                root: Box::new(
+                    tui::Block {
+                        borders: tui::Borders::all(),
+                        border_style: tui::Style {
+                            fg: Some(tui::Color::DarkGrey),
+                            ..Default::default()
+                        },
+                        border_set: tui::LineSet::thick(),
+                        inner: Some(Box::new(tray_menu_to_tui(
+                            0,
+                            submenus,
+                            addr,
+                            menu_path.as_ref(),
+                        ))),
+                    }
+                    .into(),
+                ),
             }
         }
         Menu::TrayTooltip {
@@ -459,243 +229,580 @@ pub fn to_tui(menu: &Menu) -> Option<tui::Tui> {
                     description,
                 },
         } => tui::Tui {
-            root: tui::Stack::vertical([
-                // FIXME: Should be bold and centered
-                tui::StackItem::auto(tui::Text::plain(title.as_str().into())),
-                tui::StackItem::auto(tui::Text::plain(description.as_str().into())),
-            ])
-            .into(),
+            root: Box::new(
+                tui::Stack::vertical([
+                    tui::StackItem::auto(tui::Stack::horizontal([
+                        tui::StackItem::new(tui::Constr::Fill(1), tui::Elem::Empty),
+                        tui::StackItem::auto(tui::Text::plain(title.as_str()).style(tui::Style {
+                            modifier: tui::Modifier {
+                                bold: true,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        })),
+                        tui::StackItem::new(tui::Constr::Fill(1), tui::Elem::Empty),
+                    ])),
+                    tui::StackItem::auto(tui::Text::plain(description.as_str())),
+                ])
+                .into(),
+            ),
         },
-    })
+    }
 }
 
-// TODO: Handle hovers by highlighting option
-pub async fn main(
-    ctrl_tx: mpsc::UnboundedSender<MenuEvent>,
-    mut ctrl_rx: mpsc::UnboundedReceiver<MenuUpdate>,
-) -> anyhow::Result<()> {
-    log::debug!("Starting menu");
+pub async fn run_menu_panel_manager(
+    monitor_rx: impl Stream<Item = MonitorEvent> + Send + 'static,
+    menu_upd_rx: impl Stream<Item = MenuUpdate> + Send + 'static,
+    menu_ev_tx: impl SharedEmit<MenuEvent>,
+) {
+    let mut tasks = JoinSet::<()>::new();
 
-    let socket = std::env::var("KITTY_LISTEN_ON")?;
-    // NOTE: Avoid --start-as-hidden due to https://github.com/kovidgoyal/kitty/issues/9306
-    tokio::process::Command::new("kitten")
-        .args(["@", "--to", &socket, "resize-os-window", "--action=hide"])
-        .status()
-        .await?;
+    let mut term_upd_tx;
+    {
+        let term_upd_rx;
+        (term_upd_tx, term_upd_rx) = unb_chan();
+        tasks.spawn(crate::terminals::run_term_manager(term_upd_rx));
+    }
+    let (watcher_ev_tx, watcher_ev_rx) = unb_chan();
 
-    crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::EnterAlternateScreen,
-        crossterm::cursor::Hide,
-        crossterm::event::EnableMouseCapture,
-    )?;
-    crossterm::terminal::enable_raw_mode()?;
+    // TODO: Move to function
+    tasks.spawn(async move {
+        struct Instance {
+            _tmpdir_guard: tempfile::TempDir,
+            inst_task: tokio::task::AbortHandle,
+            bar_upd_tx: tokio::sync::mpsc::UnboundedSender<Option<PanelShow>>,
+        }
+        let mut instances = HashMap::<TermId, Instance>::new();
+        let monitor_to_term_id = |name: &str| TermId::from_bytes(name.as_bytes());
+        let mut global_inst_tasks = JoinSet::<()>::new();
 
-    let mut cur_menu = Menu::None;
-    let font_size = tui::Size::query_font_size()?;
+        #[derive(Debug)]
+        enum Upd {
+            Monitor(MonitorEvent),
+            Menu(MenuUpdate),
+            Watcher((Arc<str>, MenuWatcherEvent)),
+        }
+        let updates = monitor_rx
+            .map(Upd::Monitor)
+            .merge(menu_upd_rx.map(Upd::Menu))
+            .merge(watcher_ev_rx.map(Upd::Watcher));
+        tokio::pin!(updates);
 
-    let mut ui = tui::RenderedLayout::default();
-    let siz_ctx = || tui::SizingContext {
-        font_size,
+        struct Current {
+            menu: Menu,
+            term: TermId,
+        }
+        let mut cur = None::<Current>;
+        fn shutdown(
+            instances: &mut HashMap<TermId, Instance>,
+            ids: impl IntoIterator<Item = TermId>,
+            term_upd_tx: &mut impl Emit<TermMgrUpdate>,
+        ) -> ControlFlow<()> {
+            for id in ids {
+                if let Some(inst) = instances.remove(&id) {
+                    inst.inst_task.abort();
+                    term_upd_tx.emit(TermMgrUpdate::TermUpdate(id, TermUpdate::Shutdown))?
+                }
+            }
+            ControlFlow::Continue(())
+        }
+        loop {
+            let upd = tokio::select! {
+                Some(upd) = updates.next() => upd,
+                Some(res) = global_inst_tasks.join_next() => {
+                    if let Err(err) = res && !err.is_cancelled() {
+                        log::error!("Error with task: {err}");
+                    }
+                    continue;
+                }
+            };
+
+            let mut hide = |cur: &mut Option<Current>| {
+                if let Some(Current { term, .. }) = cur.take()
+                    && let Some(inst) = instances.get_mut(&term)
+                {
+                    if inst.bar_upd_tx.emit(None).is_break() {
+                        shutdown(&mut instances, [term], &mut term_upd_tx)?;
+                    }
+                }
+                ControlFlow::Continue(())
+            };
+
+            match upd {
+                Upd::Menu(MenuUpdate::UnfocusMenu) => {
+                    if cur.as_ref().is_some_and(|it| it.menu.close_on_unfocus()) {
+                        if hide(&mut cur).is_break() {
+                            break;
+                        }
+                    }
+                }
+                Upd::Watcher((monitor, MenuWatcherEvent::Hide)) => {
+                    let term_id = monitor_to_term_id(&monitor);
+                    if cur.as_ref().is_some_and(|it| it.term == term_id) {
+                        if hide(&mut cur).is_break() {
+                            break;
+                        }
+                    } else if let Some(inst) = instances.get_mut(&term_id) {
+                        if inst.bar_upd_tx.emit(None).is_break() {
+                            if shutdown(&mut instances, [term_id], &mut term_upd_tx).is_break() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Upd::Menu(MenuUpdate::SwitchSubject {
+                    new_menu,
+                    location,
+                    monitor,
+                }) => {
+                    // Never replace a context menu with a tooltip
+                    if new_menu.close_on_unfocus()
+                        && cur.as_ref().is_some_and(|it| !it.menu.close_on_unfocus())
+                    {
+                        continue;
+                    }
+
+                    // ignore updates that try to open a tooltip that is already opened.
+                    // FIXME: Improve hovering logic so that this becomes unnecessary.
+                    if let Menu::TrayTooltip { addr: new_addr, .. } = &new_menu
+                        && let Some(Current {
+                            menu: Menu::TrayTooltip { addr, .. },
+                            ..
+                        }) = &cur
+                        && addr == new_addr
+                    {
+                        continue;
+                    }
+
+                    let term = monitor_to_term_id(&monitor);
+                    if cur.as_ref().is_some_and(|it| it.term != term) {
+                        if hide(&mut cur).is_break() {
+                            break;
+                        }
+                    }
+                    if let Some(inst) = instances.get_mut(&term) {
+                        let tui = to_tui(&new_menu);
+                        if inst
+                            .bar_upd_tx
+                            .emit(Some(PanelShow { tui, pos: location }))
+                            .is_break()
+                        {
+                            if shutdown(&mut instances, [term], &mut term_upd_tx).is_break() {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                    cur = Some(Current {
+                        menu: new_menu,
+                        term,
+                    });
+                }
+                Upd::Menu(MenuUpdate::Hide) => {
+                    if hide(&mut cur).is_break() {
+                        break;
+                    }
+                }
+                // TODO: Move into function
+                Upd::Monitor(ev) => {
+                    if shutdown(
+                        &mut instances,
+                        ev.removed()
+                            .chain(ev.added_or_changed().map(|it| &it.name as &str))
+                            .map(monitor_to_term_id),
+                        &mut term_upd_tx,
+                    )
+                    .is_break()
+                    {
+                        break;
+                    };
+
+                    for monitor in ev.added_or_changed().cloned() {
+                        let term_id = TermId::from_bytes(monitor.name.as_bytes());
+                        let (bar_upd_tx, bar_upd_rx) = tokio::sync::mpsc::unbounded_channel();
+                        let (term_ev_tx, term_ev_rx) = tokio::sync::mpsc::unbounded_channel();
+
+                        let (tmpdir, watcher_py, watcher_sock_path, watcher_sock) = {
+                            let res = tokio::task::spawn_blocking(|| {
+                                let tmpdir = tempfile::TempDir::new()?;
+                                let watcher_py = tmpdir.path().join("menu_watcher.py");
+                                std::fs::write(
+                                    &watcher_py,
+                                    include_bytes!("menu_panel/menu_watcher.py"),
+                                )?;
+
+                                let sock_path = tmpdir.path().join("menu_watcher.sock");
+                                let sock = tokio::net::UnixListener::bind(&sock_path)?;
+                                Ok((tmpdir, watcher_py, sock_path, sock))
+                            })
+                            .await;
+                            match res.map_err(anyhow::Error::from).flatten() {
+                                Ok(tup) => tup,
+                                Err(err) => {
+                                    log::error!("Failed to spawn menu: {err}");
+                                    continue;
+                                }
+                            }
+                        };
+                        let mut inst_subtasks = JoinSet::<()>::new();
+                        inst_subtasks.spawn(run_instance_mgr(
+                            menu_ev_tx.clone(),
+                            unb_rx_stream(bar_upd_rx),
+                            {
+                                let mut term_upd_tx = term_upd_tx.clone();
+                                let term_id = term_id.clone();
+                                move |upd| {
+                                    term_upd_tx
+                                        .emit(TermMgrUpdate::TermUpdate(term_id.clone(), upd))
+                                }
+                            },
+                            unb_rx_stream(term_ev_rx),
+                            monitor.clone(),
+                        ));
+
+                        // FIXME: Move to function
+                        let mut watcher_ev_tx = watcher_ev_tx.clone();
+                        let monitor_name = monitor.name.clone();
+                        inst_subtasks.spawn(async move {
+                            let Ok((mut watcher_stream, _)) =
+                                watcher_sock.accept().await.map_err(|err| {
+                                    log::error!("Failed to accept connection to watcher: {err}")
+                                })
+                            else {
+                                return;
+                            };
+
+                            use tokio::io::AsyncReadExt as _;
+                            loop {
+                                let Ok(byte) = watcher_stream.read_u8().await.map_err(|err| {
+                                    log::error!("Failed to read from watcher stream: {err}")
+                                }) else {
+                                    break;
+                                };
+                                let parsed = match byte {
+                                    0 => MenuWatcherEvent::Hide,
+                                    _ => {
+                                        log::error!("Unknown watcher event {byte}");
+                                        continue;
+                                    }
+                                };
+
+                                if watcher_ev_tx
+                                    .emit((monitor_name.clone(), parsed))
+                                    .is_break()
+                                {
+                                    break;
+                                }
+                            }
+                        });
+                        if term_upd_tx
+                            .emit(TermMgrUpdate::SpawnPanel(SpawnTerm {
+                                term_id: term_id.clone(),
+                                extra_args: vec![
+                                    {
+                                        let mut arg = OsString::from("-o=watcher=");
+                                        arg.push(watcher_py);
+                                        arg
+                                    },
+                                    format!("--output-name={}", monitor.name).into(),
+                                    // Configure remote control via socket
+                                    "-o=allow_remote_control=socket-only".into(),
+                                    "--listen-on=unix:/tmp/kitty-bar-menu-panel.sock".into(),
+                                    // Allow logging to $KITTY_STDIO_FORWARDED
+                                    "-o=forward_stdio=yes".into(),
+                                    // Do not use the system's kitty.conf
+                                    "--config=NONE".into(),
+                                    // Basic look of the menu
+                                    "-o=background_opacity=0.85".into(),
+                                    "-o=background=black".into(),
+                                    "-o=foreground=white".into(),
+                                    // location of the menu
+                                    "--edge=top".into(),
+                                    // disable hiding the mouse
+                                    "-o=mouse_hide_wait=0".into(),
+                                    // Window behavior of the menu panel. Makes panel
+                                    // act as an overlay on top of other windows.
+                                    // We do not want tilers to dedicate space to it.
+                                    // Taken from the args that quick-access-terminal uses.
+                                    "--exclusive-zone=0".into(),
+                                    "--override-exclusive-zone".into(),
+                                    "--layer=overlay".into(),
+                                    // Focus behavior of the panel. Since we cannot tell from
+                                    // mouse events alone when the cursor leaves the panel
+                                    // (since terminal mouse capture only gives us mouse
+                                    // events inside the panel), we need external support for
+                                    // hiding it automatically. We use a watcher to be able
+                                    // to reset the menu state when this happens.
+                                    "--focus-policy=on-demand".into(),
+                                    "--hide-on-focus-loss".into(),
+                                    // Since we control resizes from the program and not from
+                                    // a somewhat continuous drag-resize, debouncing between
+                                    // resize and reloads is completely inappropriate and
+                                    // just results in a larger delay between resize and
+                                    // the old menu content being replaced with the new one.
+                                    "-o=resize_debounce_time=0 0".into(),
+                                    // TODO: Mess with repaint_delay, input_delay
+                                ],
+                                extra_envs: vec![(
+                                    "BAR_MENU_WATCHER_SOCK".into(),
+                                    watcher_sock_path.into(),
+                                )],
+                                term_ev_tx,
+                            }))
+                            .is_break()
+                        {
+                            break;
+                        }
+
+                        let old = instances.insert(
+                            term_id,
+                            Instance {
+                                _tmpdir_guard: tmpdir,
+                                inst_task: global_inst_tasks.spawn(async move {
+                                    inst_subtasks
+                                        .join_next()
+                                        .await
+                                        .transpose()
+                                        .context("Task exited with error")
+                                        .ok_or_log();
+                                }),
+                                bar_upd_tx,
+                            },
+                        );
+                        assert!(old.is_none());
+                    }
+                }
+            }
+        }
+    });
+
+    if let Some(Err(err)) = tasks.join_next().await {
+        log::error!("Error with task: {err}");
+    }
+}
+
+struct PanelShow {
+    tui: tui::Tui,
+    pos: Position32,
+}
+async fn run_instance_mgr(
+    mut ev_tx: impl SharedEmit<MenuEvent>,
+    upd_rx: impl Stream<Item = Option<PanelShow>> + 'static + Send,
+    mut term_upd_tx: impl SharedEmit<TermUpdate>,
+    term_ev_rx: impl Stream<Item = TermEvent> + 'static + Send,
+    monitor: MonitorInfo,
+) {
+    tokio::pin!(term_ev_rx);
+
+    let Some(mut sizes) = async {
+        loop {
+            if let Some(TermEvent::Sizes(sizes)) = term_ev_rx.next().await {
+                break sizes;
+            }
+        }
+    }
+    .timeout(Duration::from_secs(10))
+    .await
+    .context("Failed to receive terminal sizes")
+    .ok_or_log() else {
+        return;
+    };
+
+    enum Inc {
+        Hide,
+        Show(PanelShow),
+        Term(TermEvent),
+    }
+    let incoming = upd_rx
+        .map(|maybe_show| maybe_show.map_or(Inc::Hide, Inc::Show))
+        .merge(term_ev_rx.map(Inc::Term));
+    tokio::pin!(incoming);
+
+    struct Show {
+        tui: tui::Tui,
+        pos: Position32,
+        tui_size_cache: tui::Size,
+        rendered: bool,
+    }
+    let mut show = None;
+    let mut layout = tui::RenderedLayout::default();
+
+    let siz_ctx = |sizes: tui::Sizes| tui::SizingContext {
+        font_size: sizes.font_size(),
         div_w: None,
         div_h: None,
     };
-    let do_render = |tui: &mut tui::Tui, ui: &mut _| match tui::draw(|ctx| {
-        tui.render(
-            ctx,
-            siz_ctx(),
-            tui::Area {
-                pos: Default::default(),
-                size: tui::Size::query_term_size()?,
-            },
-        )
-    }) {
-        Err(err) => log::error!("Failed to draw: {err}"),
-        Ok(layout) => *ui = layout,
-    };
 
-    let mut geometry = Geometry {
-        size: Default::default(),
-        location: Position32::ZERO,
-        font_size,
-        monitor: None,
-    };
-    let mut cur_tui = None;
-
-    #[derive(Debug)]
-    enum Upd {
-        Ctrl(MenuUpdate),
-        Term(crossterm::event::Event),
-    }
-
-    let term_stream = crossterm::event::EventStream::new()
-        .filter_map(|res| {
-            res.map_err(|err| log::error!("Crossterm stream yielded: {err}"))
-                .ok()
-        })
-        .map(Upd::Term);
-    let ctrl_stream = futures::stream::poll_fn(move |cx| ctrl_rx.poll_recv(cx)).map(Upd::Ctrl);
-    let mut menu_events = term_stream.merge(ctrl_stream);
-
-    while let Some(menu_event) = menu_events.next().await {
-        let mut new_geometry = geometry.clone();
-
-        // FIXME: Debounce to avoid racy behavior with resizing
-        let mut switch_subject = |cur_menu: &mut Menu, new_menu: Menu, location| {
-            let is_visible = new_menu.is_visible();
-            match (&*cur_menu, &new_menu) {
-                (
-                    Menu::TrayTooltip { addr, tooltip: _ },
-                    Menu::TrayTooltip {
-                        addr: addr2,
-                        tooltip: _,
-                    },
-                ) if addr == addr2 => false,
-                (Menu::None, Menu::None) => false,
-                _ => {
-                    *cur_menu = new_menu;
-                    if is_visible {
-                        new_geometry.location = location;
+    while let Some(inc) = incoming.next().await {
+        let mut resize = false;
+        let mut render_ready = false;
+        match inc {
+            Inc::Show(PanelShow { mut tui, pos }) => {
+                if let Ok(cached_size) = tui
+                    .calc_size(siz_ctx(sizes))
+                    .map_err(|err| log::error!("Failed to calculate tui size: {err}"))
+                {
+                    show = Some(Show {
+                        tui_size_cache: cached_size,
+                        tui,
+                        pos,
+                        rendered: false,
+                    });
+                    resize = true;
+                }
+            }
+            Inc::Hide => {
+                show = None;
+                resize = true;
+            }
+            Inc::Term(TermEvent::Sizes(new_sizes)) => {
+                sizes = new_sizes;
+                render_ready = true;
+            }
+            Inc::Term(TermEvent::Crossterm(ev)) => {
+                if let crossterm::event::Event::Mouse(ev) = ev
+                    && let Some(tui::TuiInteract {
+                        location,
+                        target: Some(tag),
+                        kind,
+                    }) = layout.interpret_mouse_event(ev, sizes.font_size())
+                {
+                    let interact = Interact {
+                        location,
+                        kind,
+                        target: MenuInteractTarget::deserialize_tag(&tag),
+                    };
+                    if ev_tx.emit(MenuEvent::Interact(interact)).is_break() {
+                        break;
                     }
-                    true
                 }
             }
-        };
+        }
 
-        type TE = crossterm::event::Event;
-        match menu_event {
-            Upd::Ctrl(MenuUpdate::Watcher(MenuWatcherEvent::Resize))
-            | Upd::Term(TE::Resize(_, _)) => {
-                log::debug!("Pending resize completed: {menu_event:?}");
-
-                //if let Err(err) = term.draw(|frame| ui = render_menu(&picker, &cur_menu, frame)) {
-                //    log::error!("Failed to draw: {err}")
-                //}
-                if let Some(tui) = &mut cur_tui {
-                    do_render(tui, &mut ui);
-                }
-
-                continue;
-            }
-            Upd::Term(TE::FocusGained | crossterm::event::Event::Mouse(_))
-                if cur_menu.close_on_unfocus() == Some(true) =>
+        if resize {
+            if let Some(Show {
+                pos,
+                tui_size_cache,
+                rendered: false,
+                ..
+            }) = show
             {
-                // If we have a tooltip open and the cursor moves into it, that means
-                // we missed the cursor moving off the icon and outside the bar, so we
-                // hide it right away
-                switch_subject(&mut cur_menu, Menu::None, Position32::ZERO);
-            }
-            Upd::Term(TE::FocusLost | crossterm::event::Event::FocusGained) => {
-                continue;
-            }
-            Upd::Term(TE::Key(_)) => continue,
-            Upd::Term(TE::Mouse(event)) => {
-                let Some(tui::TuiInteract {
-                    location,
-                    target: Some(target),
-                    kind,
-                }) = ui.interpret_mouse_event(event, font_size)
-                else {
-                    continue;
-                };
+                // No need to wait before rendering if we have enough space
+                if tui_size_cache.w >= sizes.cell_size.w && tui_size_cache.h >= sizes.cell_size.h {
+                    render_ready = true;
+                }
+                if tui_size_cache != sizes.cell_size {
+                    // NOTE: There is no absolute positioning system, nor a way to directly specify the
+                    // geometry (since this is controlled by the compositor). So we have to get creative by
+                    // using the right and left margin to control both position and size of the panel.
 
-                if let Err(err) = ctrl_tx.send(MenuEvent::Interact(Interact {
-                    location,
-                    kind,
-                    target: MenuInteractTarget::deserialize_tag(&target),
-                })) {
-                    log::warn!("Failed to send interaction: {err}");
-                    break;
+                    // cap position at monitor's size
+                    let x = std::cmp::min(pos.x, monitor.width);
+
+                    // Find the distance between window edge and center
+                    // HACK: The margin calculation is always slightly too small, so add a few cells to the
+                    // calculation
+                    // TODO: Find out if this needs to increase with the width or if the error is constant
+                    // TODO: Try checking against window size (include delta from current cells * font)
+                    let half_pix_w = (u32::from(tui_size_cache.w + 1)
+                        * u32::from(sizes.font_size().w))
+                    .div_ceil(2);
+
+                    // The left margin should be such that half the space is between
+                    // left margin and x. Use saturating_sub so that the left
+                    // margin becomes zero if the width would reach outside the screen.
+                    let mleft = x.saturating_sub(half_pix_w);
+
+                    // Get the overshoot, i.e. the amount lost to saturating_sub (we have to account for it
+                    // in the right margin). For this observe that a.saturating_sub(b) = a - min(a, b) and
+                    // therefore the overshoot is:
+                    // a.saturating_sub(b) - (a - b)
+                    // = a - min(a, b) - (a - b)
+                    // = b - min(a, b)
+                    // = b.saturating_sub(a)
+                    let overshoot = half_pix_w.saturating_sub(x);
+
+                    let mright = (monitor.width - x)
+                        .saturating_sub(half_pix_w)
+                        .saturating_sub(overshoot);
+
+                    // The font size (on which cell->pixel conversion is based) and the monitor's
+                    // size are in physical pixels. This makes sense because different monitors can
+                    // have different scales, and the application should not be affected by that
+                    // (this is not x11 after all).
+                    // However, panels are bound to a monitor and the margins are in scaled pixels,
+                    // so we have to make this correction.
+                    let margin_left = (f64::from(mleft) / monitor.scale) as u32;
+                    let margin_right = (f64::from(mright) / monitor.scale) as u32;
+
+                    if term_upd_tx
+                        .emit(TermUpdate::RemoteControl(vec![
+                            "resize-os-window".into(),
+                            "--incremental".into(),
+                            "--action=os-panel".into(),
+                            format!("margin-left={margin_left}").into(),
+                            format!("margin-right={margin_right}").into(),
+                            format!("lines={}", tui_size_cache.h).into(),
+                        ]))
+                        .is_break()
+                    {
+                        break;
+                    };
                 }
             }
-            Upd::Ctrl(MenuUpdate::Watcher(MenuWatcherEvent::Hide)) => {
-                switch_subject(&mut cur_menu, Menu::None, Position32::ZERO);
-            }
-            Upd::Ctrl(MenuUpdate::UnfocusMenu) => {
-                if cur_menu.close_on_unfocus() != Some(true) {
-                    continue;
-                }
-                if !switch_subject(&mut cur_menu, Menu::None, Position32::ZERO) {
-                    continue;
-                }
-            }
-            Upd::Ctrl(MenuUpdate::ActiveMonitor(ams)) => new_geometry.monitor = ams,
-            Upd::Ctrl(MenuUpdate::SwitchSubject { new_menu, location }) => {
-                // Do not replace a menu with a tooltip
-                if new_menu.close_on_unfocus() == Some(true)
-                    && cur_menu.close_on_unfocus() == Some(false)
-                {
-                    continue;
-                }
-                if !switch_subject(&mut cur_menu, new_menu, location) {
-                    continue;
-                }
-            }
-            Upd::Ctrl(MenuUpdate::UpdateTrayMenu(addr, tmenu)) => {
-                if let Menu::TrayContext { addr: a, tmenu: t } = &mut cur_menu
-                    && *a == addr
-                {
-                    *t = tmenu;
-                } else {
-                    continue;
-                }
-            }
-            Upd::Ctrl(MenuUpdate::UpdateTrayTooltip(addr, tt)) => {
-                if let Menu::TrayTooltip {
-                    addr: a,
-                    tooltip: t,
-                } = &mut cur_menu
-                    && *a == addr
-                {
-                    match tt {
-                        Some(tt) => *t = tt,
-                        None => cur_menu = Menu::None,
-                    }
-                } else {
-                    continue;
-                }
-            }
-            Upd::Ctrl(MenuUpdate::RemoveTray(addr)) => {
-                if let Menu::TrayContext { addr: a, tmenu: _ }
-                | Menu::TrayTooltip {
-                    addr: a,
-                    tooltip: _,
-                } = &cur_menu
-                    && *a == addr
-                {
-                    cur_menu = Menu::None;
-                } else {
-                    continue;
-                }
-            }
-            Upd::Ctrl(MenuUpdate::ConnectTrayMenu { addr, menu_path }) => {
-                if let Menu::TrayContext { addr: a, tmenu: tm } = &mut cur_menu
-                    && a as &str == addr.as_str()
-                {
-                    tm.menu_path = menu_path.map(Into::into);
-                } else {
-                    continue;
-                }
+
+            // TODO: be smarter about when to run this
+            let action = if show.is_some() { "show" } else { "hide" };
+            if term_upd_tx
+                .emit(TermUpdate::RemoteControl(vec![
+                    "resize-os-window".into(),
+                    format!("--action={}", action).into(),
+                ]))
+                .is_break()
+            {
+                break;
             }
         }
-
-        cur_tui = to_tui(&cur_menu);
-        if let Some(tui) = &mut cur_tui {
-            match tui.calc_size(siz_ctx()) {
-                Ok(size) => new_geometry.size = size,
-                Err(err) => {
-                    log::error!("Failed to calculate size of broken tui (skipping): {err}");
-                    cur_tui = None;
-                }
-            }
-        }
-        if !adjust_terminal(&new_geometry, &geometry, &socket, cur_tui.is_some()).await?
-            && let Some(tui) = &mut cur_tui
+        if render_ready
+            && let Some(Show {
+                ref mut tui,
+                rendered: ref mut rendered @ false,
+                tui_size_cache,
+                ..
+            }) = show
         {
-            do_render(tui, &mut ui)
-        }
-        geometry = new_geometry;
-    }
+            if tui_size_cache.w < sizes.cell_size.w || tui_size_cache.h < sizes.cell_size.h {
+                log::error!("Tui will not fit into panel");
+            }
 
-    Ok(())
+            let mut buf = Vec::new();
+            match tui::draw_to(&mut buf, |ctx| {
+                let size = tui_size_cache; // Or term size
+                tui.render(
+                    ctx,
+                    tui::SizingContext {
+                        font_size: sizes.font_size(),
+                        div_w: Some(size.w),
+                        div_h: Some(size.h),
+                    },
+                    tui::Area {
+                        // FIXME: probably better to render at the tui's size
+                        size,
+                        pos: Default::default(),
+                    },
+                )
+            }) {
+                Err(err) => log::error!("Failed to draw: {err}"),
+                Ok(new_layout) => {
+                    layout = new_layout;
+                    *rendered = true;
+                }
+            }
+            if term_upd_tx.emit(TermUpdate::Print(buf)).is_break()
+                || term_upd_tx.emit(TermUpdate::Flush).is_break()
+            {
+                break;
+            }
+        }
+    }
 }

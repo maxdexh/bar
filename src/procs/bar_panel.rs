@@ -1,13 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
+    ops::ControlFlow,
     sync::Arc,
+    time::Duration,
 };
 
+use anyhow::Context;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use system_tray::item::StatusNotifierItem;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
+use tokio_util::time::FutureExt;
 
 use crate::{
     clients::{
@@ -18,7 +22,7 @@ use crate::{
     data::{BasicDesktopState, WorkspaceId},
     terminals::{SpawnTerm, TermEvent, TermId, TermMgrUpdate, TermUpdate},
     tui,
-    utils::{Emit as _, SharedEmit, ubchan, unb_rx_stream},
+    utils::{Emit, ResultExt as _, SharedEmit, unb_chan, unb_rx_stream},
 };
 
 pub async fn run_bar_panel_manager(
@@ -26,24 +30,23 @@ pub async fn run_bar_panel_manager(
     bar_upd_rx: impl Stream<Item = BarUpdate> + Send + 'static,
     bar_ev_tx: impl SharedEmit<(BarEventInfo, BarEvent)>,
 ) {
-    let mut tasks = JoinSet::new();
+    let mut tasks = JoinSet::<()>::new();
 
     let mut term_upd_tx;
     {
         let term_upd_rx;
-        (term_upd_tx, term_upd_rx) = ubchan();
+        (term_upd_tx, term_upd_rx) = unb_chan();
         tasks.spawn(crate::terminals::run_term_manager(term_upd_rx));
     }
 
     tasks.spawn(async move {
         struct Instance {
             monitor_name: Arc<str>,
-            listener: tokio::task::AbortHandle,
+            inst_task: tokio::task::AbortHandle,
             upd_tx: tokio::sync::mpsc::UnboundedSender<Arc<BarState>>,
         }
         let mut instances = HashMap::<TermId, Instance>::new();
-        let mut by_monitor = HashMap::<Arc<str>, HashSet<TermId>>::new();
-        let mut subtasks = JoinSet::new();
+        let mut subtasks = JoinSet::<()>::new();
 
         enum Upd {
             Monitor(MonitorEvent),
@@ -56,6 +59,19 @@ pub async fn run_bar_panel_manager(
 
         let mut state = BarState::default();
 
+        fn shutdown(
+            ids: impl IntoIterator<Item = TermId>,
+            instances: &mut HashMap<TermId, Instance>,
+            term_upd_tx: &mut impl Emit<TermMgrUpdate>,
+        ) -> ControlFlow<()> {
+            for id in ids {
+                if let Some(inst) = instances.remove(&id) {
+                    inst.inst_task.abort();
+                    term_upd_tx.emit(TermMgrUpdate::TermUpdate(id, TermUpdate::Shutdown))?
+                }
+            }
+            ControlFlow::Continue(())
+        }
         loop {
             let upd = tokio::select! {
                 Some(upd) = updates.next() => upd,
@@ -78,52 +94,40 @@ pub async fn run_bar_panel_manager(
                             shutdown_queue.push(term_id.clone());
                         }
                     }
-                    if !shutdown_queue.is_empty() {
-                        for id in &shutdown_queue {
-                            let Some(inst) = instances.remove(id) else {
-                                continue;
-                            };
-                            if let Some(insts) = by_monitor.get_mut(&inst.monitor_name) {
-                                insts.remove(id);
-                            }
-                            inst.listener.abort();
-                        }
-                        if term_upd_tx
-                            .emit(TermMgrUpdate::TermUpdate(
-                                shutdown_queue,
-                                TermUpdate::Shutdown,
-                            ))
-                            .is_break()
-                        {
-                            break;
-                        }
+                    if shutdown(shutdown_queue, &mut instances, &mut term_upd_tx).is_break() {
+                        break;
                     }
                 }
                 Upd::Monitor(ev) => {
-                    let removed: Vec<_> = ev
-                        .removed()
-                        .chain(ev.added().map(|it| &it.name as &str))
-                        .flat_map(|name| by_monitor.remove(name).unwrap_or_default())
-                        .filter_map(|id| instances.remove_entry(&id))
-                        .map(|(id, inst)| {
-                            inst.listener.abort();
-                            id
-                        })
-                        .collect();
+                    if shutdown(
+                        {
+                            let shutdown_monitors: HashSet<_> = ev
+                                .removed()
+                                .chain(ev.added_or_changed().map(|it| &it.name as &str))
+                                .collect();
 
-                    if !removed.is_empty()
-                        && term_upd_tx
-                            .emit(TermMgrUpdate::TermUpdate(removed, TermUpdate::Shutdown))
-                            .is_break()
+                            instances
+                                .iter()
+                                .filter(|(_, inst)| {
+                                    shutdown_monitors.contains(&inst.monitor_name as &str)
+                                })
+                                .map(|(id, _)| id.clone())
+                                .collect::<Vec<_>>()
+                        },
+                        &mut instances,
+                        &mut term_upd_tx,
+                    )
+                    .is_break()
                     {
                         break;
                     }
 
-                    for monitor in ev.added() {
+                    for monitor in ev.added_or_changed() {
                         let bar_info = BarEventInfo {
-                            monitor_name: monitor.name.clone(),
+                            monitor: monitor.name.clone(),
                         };
-                        let term_id = TermId::from_bytes(monitor.name.as_bytes());
+                        let term_id =
+                            TermId::from_bytes(format!("BAR-{}", monitor.name).as_bytes());
                         let (bar_upd_tx, bar_upd_rx) = tokio::sync::mpsc::unbounded_channel();
                         let (term_ev_tx, term_ev_rx) = tokio::sync::mpsc::unbounded_channel();
                         let listener = subtasks.spawn(run_instance_controller(
@@ -138,7 +142,7 @@ pub async fn run_bar_panel_manager(
                                 let term_id = term_id.clone();
                                 move |upd| {
                                     term_upd_tx
-                                        .emit(TermMgrUpdate::TermUpdate(vec![term_id.clone()], upd))
+                                        .emit(TermMgrUpdate::TermUpdate(term_id.clone(), upd))
                                 }
                             },
                             unb_rx_stream(term_ev_rx),
@@ -161,21 +165,17 @@ pub async fn run_bar_panel_manager(
                                     "-o=mouse_hide_wait=0".into(),
                                 ],
                                 extra_envs: Default::default(),
-                                event_tx: term_ev_tx,
+                                term_ev_tx,
                             }))
                             .is_break()
                         {
                             break;
                         }
-                        by_monitor
-                            .entry(monitor.name.clone())
-                            .or_default()
-                            .insert(term_id.clone());
                         let old = instances.insert(
                             term_id,
                             Instance {
                                 monitor_name: monitor.name.clone(),
-                                listener,
+                                inst_task: listener,
                                 upd_tx: bar_upd_tx,
                             },
                         );
@@ -199,15 +199,17 @@ async fn run_instance_controller(
 ) {
     tokio::pin!(term_ev_rx);
 
-    let Ok(mut sizes) = tokio::time::timeout(tokio::time::Duration::from_secs(10), async {
+    let Some(mut sizes) = async {
         loop {
             if let Some(TermEvent::Sizes(sizes)) = term_ev_rx.next().await {
                 break sizes;
             }
         }
-    })
+    }
+    .timeout(Duration::from_secs(10))
     .await
-    .map_err(|err| log::error!("Failed to receive terminal sizes: {err}")) else {
+    .context("Failed to receive terminal sizes")
+    .ok_or_log() else {
         return;
     };
 
@@ -219,13 +221,13 @@ async fn run_instance_controller(
     tokio::pin!(incoming);
 
     // TODO: pass monitor name
-    let mut tui = to_tui(&BarState::default());
+    let mut tui = to_tui(&BarState::default(), &monitor_name);
     let mut layout = tui::RenderedLayout::default();
     while let Some(inc) = incoming.next().await {
         let mut rerender = false;
         match inc {
             Inc::Bar(new_state) => {
-                tui = to_tui(&new_state);
+                tui = to_tui(&new_state, &monitor_name);
                 rerender = true;
             }
             Inc::Term(TermEvent::Crossterm(ev)) => {
@@ -258,7 +260,6 @@ async fn run_instance_controller(
             let mut buf = Vec::new();
             match tui::draw_to(&mut buf, |ctx| {
                 let size = sizes.cell_size;
-                log::debug!("{size:?}");
                 tui.render(
                     ctx,
                     tui::SizingContext {
@@ -292,7 +293,7 @@ pub enum BarEvent {
 }
 #[derive(Clone, Debug)]
 pub struct BarEventInfo {
-    pub monitor_name: Arc<str>,
+    pub monitor: Arc<str>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -338,7 +339,7 @@ impl BarState {
     fn apply_update(&mut self, update: BarUpdate) {
         match update {
             BarUpdate::SysTray(systray) => self.systray = systray,
-            BarUpdate::Desktop(hypr) => self.desktop = hypr,
+            BarUpdate::Desktop(desktop) => self.desktop = desktop,
             BarUpdate::Energy(energy) => self.energy = energy,
             BarUpdate::Ppd(profile) => self.ppd_profile = profile,
             BarUpdate::Pulse(pulse) => self.pulse = pulse,
@@ -347,17 +348,22 @@ impl BarState {
     }
 }
 
-fn to_tui(state: &BarState) -> tui::Tui {
+fn to_tui(state: &BarState, monitor_name: &str) -> tui::Tui {
     let mut subdiv = Vec::new();
 
     subdiv.push(tui::StackItem::spacing(1));
 
     for ws in state.desktop.workspaces.iter() {
-        // FIXME: Green active_ws
+        if ws.monitor.as_deref() != Some(monitor_name) {
+            continue;
+        }
         subdiv.extend([
             tui::StackItem::auto(tui::TagElem::new(
                 BarInteractTarget::HyprWorkspace(ws.id.clone()).serialize_tag(),
-                tui::Text::plain(ws.name.clone()),
+                tui::Text::plain(&ws.name).style(tui::Style {
+                    fg: ws.is_active.then_some(tui::Color::Green),
+                    ..Default::default()
+                }),
             )),
             tui::StackItem::spacing(1),
         ])
@@ -436,12 +442,12 @@ fn to_tui(state: &BarState) -> tui::Tui {
             tui::StackItem::spacing(SPACING),
             tui::StackItem::auto(tui::TagElem::new(
                 BarInteractTarget::Audio(PulseDeviceKind::Source).serialize_tag(),
-                tui::Text::plain(source.into()),
+                tui::Text::plain(source),
             )),
             tui::StackItem::spacing(SPACING),
             tui::StackItem::auto(tui::TagElem::new(
                 BarInteractTarget::Audio(PulseDeviceKind::Sink).serialize_tag(),
-                tui::Text::plain(sink.into()),
+                tui::Text::plain(sink),
             )),
         ]);
     }
@@ -467,11 +473,11 @@ fn to_tui(state: &BarState) -> tui::Tui {
             tui::StackItem::spacing(SPACING),
             tui::StackItem::auto(tui::TagElem::new(
                 BarInteractTarget::Ppd.serialize_tag(),
-                tui::Text::plain(ppd_symbol.into()),
+                tui::Text::plain(ppd_symbol),
             )),
             tui::StackItem::auto(tui::TagElem::new(
                 BarInteractTarget::Energy.serialize_tag(),
-                tui::Text::plain(energy.into()),
+                tui::Text::plain(energy),
             )),
         ]);
     }
@@ -481,7 +487,7 @@ fn to_tui(state: &BarState) -> tui::Tui {
             tui::StackItem::spacing(SPACING),
             tui::StackItem::auto(tui::TagElem::new(
                 BarInteractTarget::Time.serialize_tag(),
-                tui::Text::plain(state.time.as_str().into()),
+                tui::Text::plain(&state.time),
             )),
         ])
     }
@@ -489,6 +495,6 @@ fn to_tui(state: &BarState) -> tui::Tui {
     subdiv.push(tui::StackItem::spacing(1));
 
     tui::Tui {
-        root: tui::Stack::horizontal(subdiv).into(),
+        root: Box::new(tui::Stack::horizontal(subdiv).into()),
     }
 }

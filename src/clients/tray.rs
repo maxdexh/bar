@@ -5,7 +5,7 @@ use system_tray::item::StatusNotifierItem;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt as _;
 
-use crate::utils::{ReloadRx, broadcast_stream};
+use crate::utils::{ReloadRx, lossy_broadcast};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TrayMenuInteract {
@@ -25,7 +25,7 @@ pub fn connect(
     reload_rx: ReloadRx,
 ) -> (
     broadcast::Sender<TrayMenuInteract>,
-    impl Stream<Item = (TrayEvent, TrayState)>,
+    impl Stream<Item = TrayState>,
 ) {
     let (interact_tx, interact_rx) = broadcast::channel(50);
 
@@ -57,7 +57,7 @@ async fn run_interaction(
     client: system_tray::client::Client,
     interact_rx: broadcast::Receiver<TrayMenuInteract>,
 ) {
-    let interacts = broadcast_stream(interact_rx);
+    let interacts = lossy_broadcast(interact_rx);
     tokio::pin!(interacts);
     while let Some(interact) = interacts.next().await {
         let TrayMenuInteract {
@@ -84,7 +84,7 @@ fn mk_stream(
     items_mutex: Arc<std::sync::Mutex<system_tray::data::BaseMap>>,
     client_rx: broadcast::Receiver<TrayEvent>,
     reload_rx: ReloadRx,
-) -> impl Stream<Item = (TrayEvent, TrayState)> {
+) -> impl Stream<Item = TrayState> {
     let menu_paths = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     let handle_event = move |ev| {
@@ -122,25 +122,20 @@ fn mk_stream(
                 }
                 items.push((addr, item.clone()));
             }
-            (
-                ev,
-                TrayState {
-                    items: items.into(),
-                    menus: menus.into(),
-                },
-            )
+            TrayState {
+                items: items.into(),
+                menus: menus.into(),
+            }
         })
     };
 
-    broadcast_stream(client_rx)
+    lossy_broadcast(client_rx)
         .map(Some)
         .merge(reload_rx.into_stream().map(|()| None))
         .then(handle_event)
         .filter_map(|res| {
-            let (ev, state) = res
-                .map_err(|err| log::error!("Failed to join blocking task: {err}"))
-                .ok()?;
-            Some((ev?, state))
+            res.map_err(|err| log::error!("Failed to join blocking task: {err}"))
+                .ok()
         })
 }
 

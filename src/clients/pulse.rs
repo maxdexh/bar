@@ -23,14 +23,11 @@ use std::{
     sync::{Arc, atomic::AtomicBool},
 };
 
-use crate::utils::{ReloadRx, broadcast_stream};
+use crate::utils::{ReloadRx, SharedEmit, lossy_broadcast};
 
 pub fn connect(
     reload_rx: ReloadRx,
-) -> (
-    broadcast::Sender<PulseUpdate>,
-    impl Stream<Item = PulseState>,
-) {
+) -> (impl SharedEmit<PulseUpdate>, impl Stream<Item = PulseState>) {
     let (ev_tx, ev_rx) = broadcast::channel(50);
     std::thread::spawn(|| match run_blocking(ev_tx, reload_rx) {
         Ok(()) => log::warn!("PulseAudio client has quit"),
@@ -39,13 +36,13 @@ pub fn connect(
     let (up_tx, up_rx) = broadcast::channel(100);
 
     tokio::task::spawn(async move {
-        match run_updater(broadcast_stream(up_rx)).await {
+        match run_updater(lossy_broadcast(up_rx)).await {
             Ok(()) => log::warn!("PulseAudio updater has quit"),
             Err(err) => log::error!("PulseAudio updater has failed: {err}"),
         }
     });
 
-    (up_tx, broadcast_stream(ev_rx))
+    (up_tx, lossy_broadcast(ev_rx))
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]
@@ -137,7 +134,7 @@ fn run_blocking(tx: broadcast::Sender<PulseState>, mut reload_rx: ReloadRx) -> a
     fn update_and_send(
         kind: PulseDeviceKind,
         state: Rc<RefCell<PulseState>>,
-        tx: broadcast::Sender<PulseState>,
+        mut tx: impl SharedEmit<PulseState>,
         context: &RefCell<Context>,
     ) {
         let name = {
@@ -152,8 +149,8 @@ fn run_blocking(tx: broadcast::Sender<PulseState>, mut reload_rx: ReloadRx) -> a
             return;
         };
 
-        let doit = move |volume: &ChannelVolumes, muted: bool| {
-            {
+        let mut doit = move |volume: &ChannelVolumes, muted: bool| {
+            _ = tx.emit({
                 let mut state = state.borrow_mut();
                 let dstate = match kind {
                     PulseDeviceKind::Sink => &mut state.sink,
@@ -161,12 +158,8 @@ fn run_blocking(tx: broadcast::Sender<PulseState>, mut reload_rx: ReloadRx) -> a
                 };
                 dstate.volume = avg_volume_frac(volume);
                 dstate.muted = muted;
-            }
-
-            if let Err(err) = tx.send(state.borrow().clone()) {
-                log::warn!("Failed to send pulse update: {err}");
-                // FIXME: Exit here
-            }
+                state.clone()
+            });
         };
 
         match kind {

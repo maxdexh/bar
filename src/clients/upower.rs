@@ -4,7 +4,7 @@ use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 pub use udbus::*;
 
-use crate::utils::{ReloadRx, broadcast_stream};
+use crate::utils::{ReloadRx, lossy_broadcast};
 
 // https://upower.freedesktop.org/docs/UPower.html
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -37,7 +37,7 @@ pub fn connect(reload_rx: ReloadRx) -> impl Stream<Item = EnergyState> {
         }
     });
 
-    broadcast_stream(rx)
+    lossy_broadcast(rx)
 }
 async fn run(tx: broadcast::Sender<EnergyState>, reload_rx: ReloadRx) -> anyhow::Result<()> {
     let dbus = zbus::Connection::system().await?;

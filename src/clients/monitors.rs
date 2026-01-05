@@ -10,7 +10,7 @@ pub struct MonitorInfo {
     pub height: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct MonitorEvent {
     data: Arc<HashMap<Arc<str>, MonitorInfo>>,
     prev: Arc<HashMap<Arc<str>, MonitorInfo>>,
@@ -22,24 +22,19 @@ impl MonitorEvent {
             .filter(|&it| !self.data.contains_key(it))
             .map(|name| &**name)
     }
-    pub fn added(&self) -> impl Iterator<Item = &MonitorInfo> {
+    pub fn added_or_changed(&self) -> impl Iterator<Item = &MonitorInfo> {
         self.data
             .values()
-            .filter(|&it| !self.prev.contains_key(&it.name))
-    }
-    pub fn changed(&self) -> impl Iterator<Item = &MonitorInfo> {
-        self.data
-            .values()
-            .filter(|&it| !self.prev.get(&it.name).is_some_and(|v| v != it))
+            .filter(|&it| self.prev.get(&it.name).is_none_or(|v| v != it))
     }
 }
 
-// TODO: Use wl-client instead
-pub fn connect(mut tx: impl SharedEmit<MonitorEvent>) {
-    std::thread::spawn(move || {
-        let sleep_ms = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
-        let sleep_err = || sleep_ms(2000);
-
+#[derive(Default)]
+struct State {
+    data: Arc<HashMap<Arc<str>, MonitorInfo>>,
+}
+impl State {
+    fn refresh(&mut self) -> anyhow::Result<Option<MonitorEvent>> {
         #[derive(serde::Deserialize)]
         struct MonitorData {
             name: Arc<str>,
@@ -54,75 +49,78 @@ pub fn connect(mut tx: impl SharedEmit<MonitorEvent>) {
             current: bool,
         }
 
-        let mut cur_displays = Default::default();
-        loop {
-            let Ok(std::process::Output {
-                status,
-                stdout,
-                stderr,
-            }) = std::process::Command::new("wlr-randr")
-                .arg("--json")
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output()
-                .map_err(|err| log::error!("Failed to run wlr-randr: {err}"))
-            else {
-                sleep_err();
-                continue;
-            };
+        let std::process::Output {
+            status,
+            stdout,
+            stderr,
+        } = std::process::Command::new("wlr-randr")
+            .arg("--json")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .map_err(|err| anyhow::anyhow!("Failed to run wlr-randr --json: {err}"))?;
 
-            if !status.success() {
-                log::error!(
-                    "wlr-randr --json exited with exit code {status}. Stderr: {}",
-                    String::from_utf8_lossy(&stderr),
-                );
-                sleep_err();
-                continue;
-            }
-
-            let Ok(data) = serde_json::from_slice::<Vec<MonitorData>>(&stdout).map_err(|err| {
-                log::error!("Failed to deserialize output of wlr-randr --json: {err}")
-            }) else {
-                sleep_err();
-                continue;
-            };
-
-            let displays = Arc::new(
-                data.into_iter()
-                    .filter(|md| md.enabled)
-                    .filter_map(|md| {
-                        let MonitorData {
-                            name, scale, modes, ..
-                        } = md;
-                        let MonitorMode { width, height, .. } =
-                            modes.into_iter().find(|it| it.current)?;
-                        Some((
-                            name.clone(),
-                            MonitorInfo {
-                                name,
-                                scale,
-                                width,
-                                height,
-                            },
-                        ))
-                    })
-                    .collect(),
+        if !status.success() {
+            anyhow::bail!(
+                "wlr-randr --json exited with exit code {status}. Stderr: {}",
+                String::from_utf8_lossy(&stderr),
             );
-            if displays != cur_displays {
-                if tx
-                    .emit(MonitorEvent {
-                        prev: Arc::clone(&cur_displays),
-                        data: displays.clone(),
-                    })
-                    .is_break()
-                {
-                    break;
+        }
+
+        let data = serde_json::from_slice::<Vec<MonitorData>>(&stdout).map_err(|err| {
+            anyhow::anyhow!("Failed to deserialize output of wlr-randr --json: {err}")
+        })?;
+
+        let data = Arc::new(
+            data.into_iter()
+                .filter(|md| md.enabled)
+                .filter_map(|md| {
+                    let MonitorData {
+                        name, scale, modes, ..
+                    } = md;
+                    let MonitorMode { width, height, .. } =
+                        modes.into_iter().find(|it| it.current)?;
+                    Some((
+                        name.clone(),
+                        MonitorInfo {
+                            name,
+                            scale,
+                            width,
+                            height,
+                        },
+                    ))
+                })
+                .collect(),
+        );
+        Ok(if data != self.data {
+            let old_data = std::mem::replace(&mut self.data, data.clone());
+            Some(MonitorEvent {
+                data,
+                prev: old_data,
+            })
+        } else {
+            None
+        })
+    }
+}
+
+pub fn connect(mut tx: impl SharedEmit<MonitorEvent>) {
+    std::thread::spawn(move || {
+        let mut state = State::default();
+        loop {
+            match state.refresh() {
+                Ok(ev) => {
+                    if let Some(ev) = ev
+                        && tx.emit(ev).is_break()
+                    {
+                        break;
+                    }
                 }
-
-                cur_displays = displays;
+                Err(err) => {
+                    log::error!("{err}");
+                }
             }
-
-            sleep_ms(5000);
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
     });
 }

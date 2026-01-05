@@ -25,13 +25,10 @@ pub struct InteractGeneric<T> {
     pub kind: InteractKind,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Position32 {
     pub x: u32,
     pub y: u32,
-}
-impl Position32 {
-    pub const ZERO: Self = Position32 { x: 0, y: 0 };
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -47,30 +44,15 @@ impl From<String> for WorkspaceId {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct ActiveMonitorInfo {
-    pub name: Arc<str>,
-    pub width: u32,
-    pub height: u32,
-    pub scale: f64,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BasicWorkspace {
     pub id: WorkspaceId,
     pub name: Arc<str>,
     pub monitor: Option<Arc<str>>,
+    pub is_active: bool,
 }
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize)]
 pub struct BasicDesktopState {
-    pub workspaces: Arc<[BasicWorkspace]>,
-    pub monitors: Arc<[BasicMonitor]>,
-    pub active_monitor: Option<Arc<str>>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BasicMonitor {
-    pub name: Arc<str>,
-    pub active_workspace: WorkspaceId,
+    pub workspaces: Vec<BasicWorkspace>,
 }

@@ -1,11 +1,11 @@
-use std::{borrow::Borrow, collections::HashMap, sync::Arc};
+use std::ops::ControlFlow;
 
 use futures::Stream;
 use tokio::sync::broadcast;
 
 #[track_caller]
-pub fn broadcast_stream<T: Clone>(rx: broadcast::Receiver<T>) -> impl Stream<Item = T> {
-    broadcast_stream_base(rx, |n| {
+pub fn lossy_broadcast<T: Clone>(rx: broadcast::Receiver<T>) -> impl Stream<Item = T> {
+    broadcast_stream(rx, |n| {
         log::warn!(
             "Lagged {n} items on lossy stream ({})",
             std::any::type_name::<T>()
@@ -13,7 +13,7 @@ pub fn broadcast_stream<T: Clone>(rx: broadcast::Receiver<T>) -> impl Stream<Ite
         None
     })
 }
-pub fn broadcast_stream_base<T: Clone>(
+pub fn broadcast_stream<T: Clone>(
     mut rx: broadcast::Receiver<T>,
     mut on_lag: impl FnMut(u64) -> Option<T>,
 ) -> impl Stream<Item = T> {
@@ -37,80 +37,6 @@ pub fn stream_from_fn<T>(f: impl AsyncFnMut() -> Option<T>) -> impl Stream<Item 
     )
 }
 
-struct BasicTaskMapInner<K, T> {
-    tasks: HashMap<K, tokio::task::JoinHandle<T>>,
-}
-impl<K, T> Default for BasicTaskMapInner<K, T> {
-    fn default() -> Self {
-        Self {
-            tasks: Default::default(),
-        }
-    }
-}
-impl<K, T> Drop for BasicTaskMapInner<K, T> {
-    fn drop(&mut self) {
-        for (_, handle) in self.tasks.drain() {
-            handle.abort();
-        }
-    }
-}
-pub struct BasicTaskMap<K, T> {
-    inner: Arc<std::sync::Mutex<BasicTaskMapInner<K, T>>>,
-}
-impl<K, T> Clone for BasicTaskMap<K, T> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-impl<K, T> BasicTaskMap<K, T> {
-    pub fn new() -> Self {
-        Self {
-            inner: Default::default(),
-        }
-    }
-
-    pub fn insert_spawn<Fut>(&self, key: K, fut: Fut)
-    where
-        K: std::hash::Hash + Eq + Send + 'static + Clone,
-        T: Send + 'static,
-        Fut: Future<Output = T> + Send + 'static,
-    {
-        let weak = Arc::downgrade(&self.inner);
-
-        let key_clone = key.clone();
-        let handle = tokio::spawn(async move {
-            let res = fut.await;
-            if let Some(tasks) = weak.upgrade()
-                && let Some(id) = tokio::task::try_id()
-            {
-                let mut inner = tasks.lock().unwrap_or_else(|poi| poi.into_inner());
-                if inner.tasks.get(&key_clone).is_some_and(|it| it.id() == id) {
-                    inner.tasks.remove(&key_clone);
-                }
-            }
-            res
-        });
-
-        let mut inner = self.inner.lock().unwrap_or_else(|poi| poi.into_inner());
-        if let Some(handle) = inner.tasks.insert(key, handle) {
-            handle.abort();
-        }
-    }
-
-    pub fn cancel<Q>(&self, key: &Q)
-    where
-        K: Borrow<Q> + std::hash::Hash + Eq,
-        Q: std::hash::Hash + Eq + ?Sized,
-    {
-        let mut inner = self.inner.lock().unwrap_or_else(|poi| poi.into_inner());
-        if let Some(handle) = inner.tasks.remove(key) {
-            handle.abort();
-        }
-    }
-}
-
 pub struct ReloadRx {
     rx: broadcast::Receiver<()>,
 }
@@ -130,7 +56,7 @@ impl ReloadRx {
         }
     }
     pub fn into_stream(self) -> impl Stream<Item = ()> {
-        broadcast_stream_base(self.rx, |_| Some(()))
+        broadcast_stream(self.rx, |_| Some(()))
     }
 
     // TODO: debounce/rate limit this heavily: after accepting a reload request, merge all
@@ -156,14 +82,14 @@ impl ReloadRx {
 pub fn unb_rx_stream<T>(mut rx: tokio::sync::mpsc::UnboundedReceiver<T>) -> impl Stream<Item = T> {
     futures::stream::poll_fn(move |cx| rx.poll_recv(cx))
 }
-pub fn ubchan<T>() -> (impl Emit<T> + Clone, impl Stream<Item = T>) {
+pub fn unb_chan<T>() -> (impl Emit<T> + Clone, impl Stream<Item = T>) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     (tx, unb_rx_stream(rx))
 }
 
 pub trait Emit<T> {
     #[track_caller]
-    fn emit(&mut self, value: T) -> std::ops::ControlFlow<()>;
+    fn emit(&mut self, val: T) -> ControlFlow<()>;
 }
 pub async fn dump_stream<T>(mut emit: impl Emit<T>, stream: impl Stream<Item = T>) {
     tokio::pin!(stream);
@@ -173,35 +99,58 @@ pub async fn dump_stream<T>(mut emit: impl Emit<T>, stream: impl Stream<Item = T
         }
     }
 }
-impl<T, F: FnMut(T) -> std::ops::ControlFlow<()>> Emit<T> for F {
+impl<T, F: FnMut(T) -> ControlFlow<()>> Emit<T> for F {
     #[track_caller]
-    fn emit(&mut self, value: T) -> std::ops::ControlFlow<()> {
-        self(value)
+    fn emit(&mut self, val: T) -> ControlFlow<()> {
+        self(val)
     }
 }
 #[track_caller]
-fn handle_sender_res<E: std::fmt::Display>(res: Result<(), E>) -> std::ops::ControlFlow<()> {
+fn handle_sender_res<E: std::fmt::Display>(res: Result<(), E>) -> ControlFlow<()> {
     match res {
-        Ok(()) => std::ops::ControlFlow::Continue(()),
+        Ok(()) => ControlFlow::Continue(()),
         Err(err) => {
-            log::debug!("Failed to send: {err}");
-            std::ops::ControlFlow::Break(())
+            log::warn!("Failed to send: {err}");
+            ControlFlow::Break(())
         }
     }
 }
 impl<T> Emit<T> for tokio::sync::mpsc::UnboundedSender<T> {
     #[track_caller]
-    fn emit(&mut self, value: T) -> std::ops::ControlFlow<()> {
-        handle_sender_res(self.send(value))
+    fn emit(&mut self, val: T) -> ControlFlow<()> {
+        handle_sender_res(self.send(val))
     }
 }
 impl<T> Emit<T> for std::sync::mpsc::Sender<T> {
     #[track_caller]
-    fn emit(&mut self, value: T) -> std::ops::ControlFlow<()> {
-        handle_sender_res(self.send(value))
+    fn emit(&mut self, val: T) -> ControlFlow<()> {
+        handle_sender_res(self.send(val))
+    }
+}
+impl<T> Emit<T> for tokio::sync::broadcast::Sender<T> {
+    #[track_caller]
+    fn emit(&mut self, val: T) -> ControlFlow<()> {
+        handle_sender_res(self.send(val).map(|_| ()))
     }
 }
 pub trait SharedEmit<T>: Emit<T> + Clone + 'static + Send {}
 impl<S: Emit<T> + Clone + 'static + Send, T> SharedEmit<T> for S {}
-// pub fn fused_broadcast_sink
-// pub fn patient_broadcast_sink
+
+pub trait ResultExt {
+    type Ok;
+    #[track_caller]
+    fn ok_or_log(self) -> Option<Self::Ok>;
+}
+impl<T, E: Into<anyhow::Error>> ResultExt for Result<T, E> {
+    type Ok = T;
+    #[track_caller]
+    fn ok_or_log(self) -> Option<T> {
+        match self {
+            Ok(val) => Some(val),
+            Err(err) => {
+                log::error!("{:?}", err.into());
+                None
+            }
+        }
+    }
+}

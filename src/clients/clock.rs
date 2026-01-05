@@ -1,12 +1,12 @@
-use std::ops::ControlFlow;
+use std::{ops::ControlFlow, time::Duration};
 
 use chrono::Timelike;
 use futures::Stream;
 use tokio::sync::broadcast;
 
-use crate::utils::{ReloadRx, broadcast_stream};
+use crate::utils::{ReloadRx, lossy_broadcast};
 
-const MIN_SLEEP: tokio::time::Duration = tokio::time::Duration::from_millis(250);
+const MIN_SLEEP: Duration = Duration::from_millis(250);
 
 async fn send_time(
     tx: &broadcast::Sender<String>,
@@ -31,7 +31,7 @@ pub fn connect(mut reload_rx: ReloadRx) -> impl Stream<Item = String> {
             }
         }
     });
-    broadcast_stream(rx)
+    lossy_broadcast(rx)
 }
 
 async fn run(tx: broadcast::Sender<String>) {
