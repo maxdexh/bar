@@ -141,7 +141,7 @@ fn tray_menu_item_to_tui(
             ])
             .into();
             match menu_path {
-                Some(it) => tui::TagElem {
+                Some(it) => tui::InteractElem {
                     elem,
                     tag: MenuInteractTarget::TrayMenu(TrayMenuInteract {
                         addr: addr.clone(),
@@ -609,7 +609,7 @@ async fn run_instance_mgr(
     struct Show {
         tui: tui::Tui,
         pos: Position32,
-        tui_size_cache: tui::Size,
+        tui_size_cache: tui::Vec2<u16>,
         rendered: bool,
     }
     let mut show = None;
@@ -678,7 +678,7 @@ async fn run_instance_mgr(
                 let scale = (monitor.scale * 1000.0).ceil() / 1000.0;
 
                 // No need to wait before rendering if we have enough space
-                if tui_size_cache.w <= sizes.cell_size.w && tui_size_cache.h <= sizes.cell_size.h {
+                if tui_size_cache.x <= sizes.cell_size.x && tui_size_cache.y <= sizes.cell_size.y {
                     render_ready = true;
                 }
                 if tui_size_cache != sizes.cell_size {
@@ -691,7 +691,7 @@ async fn run_instance_mgr(
 
                     // Find the distance between window edge and center
                     let half_pix_w =
-                        (u32::from(tui_size_cache.w) * u32::from(sizes.font_size().w)).div_ceil(2);
+                        (u32::from(tui_size_cache.x) * u32::from(sizes.font_size().x)).div_ceil(2);
 
                     // The left margin should be such that half the space is between
                     // left margin and x. Use saturating_sub so that the left
@@ -727,7 +727,7 @@ async fn run_instance_mgr(
                             "--action=os-panel".into(),
                             format!("margin-left={margin_left}").into(),
                             format!("margin-right={margin_right}").into(),
-                            format!("lines={}", tui_size_cache.h).into(),
+                            format!("lines={}", tui_size_cache.y).into(),
                         ]))
                         .is_break()
                     {
@@ -756,7 +756,7 @@ async fn run_instance_mgr(
                 ..
             }) = show
         {
-            if tui_size_cache.w > sizes.cell_size.w || tui_size_cache.h > sizes.cell_size.h {
+            if tui_size_cache.x > sizes.cell_size.x || tui_size_cache.y > sizes.cell_size.y {
                 log::warn!(
                     "Tui size {tui_size_cache:?} is too big for panel size {:?}",
                     sizes.cell_size
@@ -770,8 +770,8 @@ async fn run_instance_mgr(
                     ctx,
                     tui::SizingContext {
                         font_size: sizes.font_size(),
-                        div_w: Some(size.w),
-                        div_h: Some(size.h),
+                        div_w: Some(size.x),
+                        div_h: Some(size.y),
                     },
                     tui::Area {
                         // FIXME: probably better to render at the tui's size

@@ -24,17 +24,17 @@ impl std::fmt::Debug for InteractTag {
 
 #[derive(Default, Debug)]
 pub enum Elem {
-    Subdivide(Stack),
+    Stack(Stack),
     Text(Text),
     Image(Image),
     Block(Block),
-    Tagged(Box<TagElem>),
+    Tagged(Box<InteractElem>),
     #[default]
     Empty,
 }
 impl From<Stack> for Elem {
     fn from(value: Stack) -> Self {
-        Self::Subdivide(value)
+        Self::Stack(value)
     }
 }
 impl From<Image> for Elem {
@@ -47,8 +47,8 @@ impl From<Block> for Elem {
         Self::Block(value)
     }
 }
-impl From<TagElem> for Elem {
-    fn from(value: TagElem) -> Self {
+impl From<InteractElem> for Elem {
+    fn from(value: InteractElem) -> Self {
         Self::Tagged(Box::new(value))
     }
 }
@@ -108,11 +108,11 @@ impl Text {
 }
 
 #[derive(Debug)]
-pub struct TagElem {
+pub struct InteractElem {
     pub tag: InteractTag,
     pub elem: Elem,
 }
-impl TagElem {
+impl InteractElem {
     pub fn new(tag: InteractTag, elem: impl Into<Elem>) -> Self {
         Self {
             tag,
@@ -188,13 +188,13 @@ pub struct Stack {
 impl Stack {
     pub fn horizontal(parts: impl IntoIterator<Item = StackItem>) -> Self {
         Self {
-            axis: Axis::Horizontal,
+            axis: Axis::X,
             parts: FromIterator::from_iter(parts),
         }
     }
     pub fn vertical(parts: impl IntoIterator<Item = StackItem>) -> Self {
         Self {
-            axis: Axis::Vertical,
+            axis: Axis::Y,
             parts: FromIterator::from_iter(parts),
         }
     }

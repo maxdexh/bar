@@ -3,6 +3,7 @@
 mod clients;
 mod data;
 mod logging;
+mod panels;
 mod procs;
 mod terminals;
 mod tui;

@@ -4,62 +4,52 @@ use crate::{data::Position32, tui::*};
 
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Area {
-    pub pos: Position,
-    pub size: Size,
+    pub pos: Vec2<u16>,
+    pub size: Vec2<u16>,
 }
 impl Area {
     pub fn y_bottom(&self) -> u16 {
-        self.pos.y.saturating_add(self.size.h).saturating_sub(1)
+        self.pos.y.saturating_add(self.size.y).saturating_sub(1)
     }
     pub fn x_right(&self) -> u16 {
-        self.pos.x.saturating_add(self.size.w).saturating_sub(1)
+        self.pos.x.saturating_add(self.size.x).saturating_sub(1)
     }
-    pub fn contains(self, pos: Position) -> bool {
+    pub fn contains(self, pos: Vec2<u16>) -> bool {
         pos.x
             .checked_sub(self.pos.x)
-            .is_some_and(|it| it < self.size.w)
+            .is_some_and(|it| it < self.size.x)
             && pos
                 .y
                 .checked_sub(self.pos.y)
-                .is_some_and(|it| it < self.size.h)
+                .is_some_and(|it| it < self.size.y)
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Position {
-    pub x: u16,
-    pub y: u16,
+pub struct Vec2<T> {
+    pub x: T,
+    pub y: T,
 }
-impl Position {
-    pub fn get_mut(&mut self, axis: Axis) -> &mut u16 {
+
+impl<T> Vec2<T> {
+    pub fn get_mut(&mut self, axis: Axis) -> &mut T {
         let Self { x, y } = self;
         match axis {
-            Axis::Horizontal => x,
-            Axis::Vertical => y,
+            Axis::X => x,
+            Axis::Y => y,
         }
     }
-}
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Size {
-    pub w: u16,
-    pub h: u16,
-}
-impl Size {
-    pub fn get_mut(&mut self, axis: Axis) -> &mut u16 {
-        let Self { w, h } = self;
-        match axis {
-            Axis::Horizontal => w,
-            Axis::Vertical => h,
-        }
-    }
-    pub fn get(mut self, axis: Axis) -> u16 {
+    pub fn get(mut self, axis: Axis) -> T
+    where
+        T: Copy,
+    {
         *self.get_mut(axis)
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Axis {
-    Horizontal,
-    Vertical,
+    X,
+    Y,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -75,7 +65,7 @@ impl RenderedLayout {
     pub fn interpret_mouse_event(
         &mut self,
         event: crossterm::event::MouseEvent,
-        font_size: Size,
+        font_size: Vec2<u16>,
     ) -> Option<TuiInteract> {
         use crossterm::event::*;
 
@@ -85,7 +75,7 @@ impl RenderedLayout {
             row,
             modifiers: _,
         } = event;
-        let pos = Position { x: column, y: row };
+        let pos = Vec2 { x: column, y: row };
 
         let (area, tag) = self
             .widgets
@@ -121,11 +111,11 @@ impl RenderedLayout {
 
         Some(TuiInteract {
             location: {
-                let font_w = u32::from(font_size.w);
-                let font_h = u32::from(font_size.h);
+                let font_w = u32::from(font_size.x);
+                let font_h = u32::from(font_size.y);
                 Position32 {
-                    x: u32::from(area.pos.x) * font_w + u32::from(area.size.w) * font_w / 2,
-                    y: u32::from(area.pos.y) * font_h + u32::from(area.size.h) * font_h / 2,
+                    x: u32::from(area.pos.x) * font_w + u32::from(area.size.x) * font_w / 2,
+                    y: u32::from(area.pos.y) * font_h + u32::from(area.size.y) * font_h / 2,
                 }
             },
             target: tag.cloned(),
@@ -137,18 +127,18 @@ pub type TuiInteract = crate::data::InteractGeneric<Option<InteractTag>>;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sizes {
-    pub cell_size: Size,
-    pub pix_size: Size,
+    pub cell_size: Vec2<u16>,
+    pub pix_size: Vec2<u16>,
 }
 impl Sizes {
-    pub fn font_size(self) -> Size {
+    pub fn font_size(self) -> Vec2<u16> {
         let Self {
-            cell_size: Size { w, h },
-            pix_size: Size { w: pw, h: ph },
+            cell_size: Vec2 { x: w, y: h },
+            pix_size: Vec2 { x: pw, y: ph },
         } = self;
-        Size {
-            w: pw / w,
-            h: ph / h,
+        Vec2 {
+            x: pw / w,
+            y: ph / h,
         }
     }
     pub fn query() -> anyhow::Result<Self> {
@@ -162,13 +152,13 @@ impl Sizes {
             anyhow::bail!("Terminal does not support window_size");
         }
         Ok(Self {
-            cell_size: Size {
-                w: columns,
-                h: rows,
+            cell_size: Vec2 {
+                x: columns,
+                y: rows,
             },
-            pix_size: Size {
-                w: width,
-                h: height,
+            pix_size: Vec2 {
+                x: width,
+                y: height,
             },
         })
     }

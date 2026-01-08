@@ -4,7 +4,7 @@ use crate::tui::*;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SizingContext {
-    pub font_size: Size,
+    pub font_size: Vec2<u16>,
     pub div_w: Option<u16>,
     pub div_h: Option<u16>,
 }
@@ -14,7 +14,7 @@ pub struct RenderCtx<'a, W> {
 }
 
 impl Tui {
-    pub fn calc_size(&mut self, sizing: SizingContext) -> anyhow::Result<Size> {
+    pub fn calc_size(&mut self, sizing: SizingContext) -> anyhow::Result<Vec2<u16>> {
         self.root.calc_auto_size(sizing)
     }
     pub fn render(
@@ -28,14 +28,14 @@ impl Tui {
 }
 impl Elem {
     // TODO: Pass constraint and axis to size calc method, generalize, split auto into Fit, Fill
-    pub fn calc_auto_size(&mut self, sizing: SizingContext) -> anyhow::Result<Size> {
+    pub fn calc_auto_size(&mut self, sizing: SizingContext) -> anyhow::Result<Vec2<u16>> {
         auto_size_invariants(sizing, || match self {
-            Self::Subdivide(subdiv) => subdiv.calc_auto_size(sizing),
+            Self::Stack(subdiv) => subdiv.calc_auto_size(sizing),
             Self::Text(text) => text.calc_auto_size(sizing),
             Self::Image(image) => image.calc_auto_size(sizing),
             Self::Block(block) => block.calc_auto_size(sizing),
             Self::Tagged(elem) => elem.elem.calc_auto_size(sizing),
-            Self::Empty => Ok(Size::default()),
+            Self::Empty => Ok(Vec2::default()),
         })
     }
     pub fn render(
@@ -45,7 +45,7 @@ impl Elem {
         area: Area,
     ) -> std::io::Result<()> {
         match self {
-            Self::Subdivide(subdiv) => subdiv.render(ctx, sizing, area),
+            Self::Stack(subdiv) => subdiv.render(ctx, sizing, area),
             Self::Image(image) => image.render(ctx, sizing, area),
             Self::Block(block) => block.render(ctx, sizing, area),
             Self::Text(text) => text.render(ctx, sizing, area),
@@ -62,10 +62,10 @@ impl Image {
     // (div_w, div_h), if specified. Errors if neither is specified.
     //
     // Also returns the axis that is being filled.
-    fn calc_fill_size(&mut self, sizing: SizingContext) -> anyhow::Result<(Axis, Size)> {
-        let Size {
-            w: font_w,
-            h: font_h,
+    fn calc_fill_size(&mut self, sizing: SizingContext) -> anyhow::Result<(Axis, Vec2<u16>)> {
+        let Vec2 {
+            x: font_w,
+            y: font_h,
         } = sizing.font_size;
 
         let img = self.load()?;
@@ -81,34 +81,34 @@ impl Image {
             // it is effectively unconstrained along the horizontal axis. That makes
             // it the flex axis, the other the fill axis.
             (Some(w), Some(h)) => match f64::from(w) / f64::from(h) > cell_ratio {
-                true => (Axis::Vertical, h),
-                false => (Axis::Horizontal, w),
+                true => (Axis::Y, h),
+                false => (Axis::X, w),
             },
-            (None, Some(h)) => (Axis::Vertical, h),
-            (Some(w), None) => (Axis::Horizontal, w),
+            (None, Some(h)) => (Axis::Y, h),
+            (Some(w), None) => (Axis::X, w),
             (None, None) => anyhow::bail!("sizing context must include some dimension to fill"),
         };
 
         Ok((
             fill_axis,
             match fill_axis {
-                Axis::Vertical => Size {
-                    h: fill_axis_len,
+                Axis::Y => Vec2 {
+                    y: fill_axis_len,
                     // cell ratio is width over height, so we get the flex dimension by multiplying
-                    w: (cell_ratio * f64::from(fill_axis_len)).ceil() as _,
+                    x: (cell_ratio * f64::from(fill_axis_len)).ceil() as _,
                 },
-                Axis::Horizontal => Size {
-                    w: fill_axis_len,
+                Axis::X => Vec2 {
+                    x: fill_axis_len,
                     // likewise, but by division
-                    h: (cell_ratio / f64::from(fill_axis_len)).ceil() as _,
+                    y: (cell_ratio / f64::from(fill_axis_len)).ceil() as _,
                 },
             },
         ))
     }
-    pub fn calc_auto_size(&mut self, sizing: SizingContext) -> anyhow::Result<Size> {
+    pub fn calc_auto_size(&mut self, sizing: SizingContext) -> anyhow::Result<Vec2<u16>> {
         auto_size_invariants(sizing, || {
             Ok(match (sizing.div_w, sizing.div_h) {
-                (Some(w), Some(h)) => Size { w, h },
+                (Some(w), Some(h)) => Vec2 { x: w, y: h },
                 _ => self.calc_fill_size(sizing)?.1,
             })
         })
@@ -149,8 +149,8 @@ impl Image {
             img.width(),
             img.height(),
             match fill_axis {
-                Axis::Horizontal => "c",
-                Axis::Vertical => "r",
+                Axis::X => "c",
+                Axis::Y => "r",
             },
             fill_size.get(fill_axis),
         )?;
@@ -171,44 +171,44 @@ impl Stack {
         part: &mut StackItem,
         sizing: SizingContext,
         axis: Axis,
-    ) -> anyhow::Result<Size> {
+    ) -> anyhow::Result<Vec2<u16>> {
         part.elem
             .calc_auto_size(Self::inner_sizing_arg(&part.constr, sizing, axis))
     }
     fn inner_sizing_arg(constr: &Constr, sizing: SizingContext, axis: Axis) -> SizingContext {
         match *constr {
             Constr::Length(l) => match axis {
-                Axis::Horizontal => SizingContext {
+                Axis::X => SizingContext {
                     div_w: Some(l),
                     ..sizing
                 },
-                Axis::Vertical => SizingContext {
+                Axis::Y => SizingContext {
                     div_h: Some(l),
                     ..sizing
                 },
             },
             Constr::Fill(_) | Constr::Auto => match axis {
-                Axis::Horizontal => SizingContext {
+                Axis::X => SizingContext {
                     div_w: None,
                     ..sizing
                 },
-                Axis::Vertical => SizingContext {
+                Axis::Y => SizingContext {
                     div_h: None,
                     ..sizing
                 },
             },
         }
     }
-    pub fn calc_auto_size(&mut self, sizing: SizingContext) -> anyhow::Result<Size> {
+    pub fn calc_auto_size(&mut self, sizing: SizingContext) -> anyhow::Result<Vec2<u16>> {
         auto_size_invariants(sizing, || {
-            let mut size = Size::default();
+            let mut size = Vec2::default();
             for part in &mut self.parts {
                 let elem_size = Self::calc_elem_auto_size(part, sizing, self.axis)?;
-                let horiz = (&mut size.w, elem_size.w);
-                let vert = (&mut size.h, elem_size.h);
+                let horiz = (&mut size.x, elem_size.x);
+                let vert = (&mut size.y, elem_size.y);
                 let ((adst, asrc), (mdst, msrc)) = match self.axis {
-                    Axis::Horizontal => (horiz, vert),
-                    Axis::Vertical => (vert, horiz),
+                    Axis::X => (horiz, vert),
+                    Axis::Y => (vert, horiz),
                 };
                 *adst += asrc;
                 *mdst = msrc.max(*mdst);
@@ -299,12 +299,12 @@ impl Stack {
 }
 // TODO: Styling (using crossterm)
 impl Text {
-    pub fn calc_auto_size(&mut self, sizing: SizingContext) -> anyhow::Result<Size> {
+    pub fn calc_auto_size(&mut self, sizing: SizingContext) -> anyhow::Result<Vec2<u16>> {
         // TODO: Warn if text is too large
         auto_size_invariants(sizing, || {
-            Ok(Size {
-                w: self.width,
-                h: self.lines.iter().map(|line| line.height).sum(),
+            Ok(Vec2 {
+                x: self.width,
+                y: self.lines.iter().map(|line| line.height).sum(),
             })
         })
     }
@@ -337,20 +337,20 @@ impl Text {
     }
 }
 impl Block {
-    fn extra_dim(&self) -> Size {
+    fn extra_dim(&self) -> Vec2<u16> {
         let Borders {
             top,
             bottom,
             left,
             right,
         } = self.borders;
-        Size {
-            w: u16::from(left) + u16::from(right),
-            h: u16::from(top) + u16::from(bottom),
+        Vec2 {
+            x: u16::from(left) + u16::from(right),
+            y: u16::from(top) + u16::from(bottom),
         }
     }
     fn inner_sizing_arg(&self, mut sizing: SizingContext) -> SizingContext {
-        let Size { w, h } = self.extra_dim();
+        let Vec2 { x: w, y: h } = self.extra_dim();
         if let Some(div_w) = &mut sizing.div_w {
             *div_w -= w;
         }
@@ -359,7 +359,7 @@ impl Block {
         }
         sizing
     }
-    pub fn calc_auto_size(&mut self, sizing: SizingContext) -> anyhow::Result<Size> {
+    pub fn calc_auto_size(&mut self, sizing: SizingContext) -> anyhow::Result<Vec2<u16>> {
         auto_size_invariants(sizing, || {
             let inner_ctx = self.inner_sizing_arg(sizing);
             let mut size = self
@@ -368,9 +368,9 @@ impl Block {
                 .map(|it| it.calc_auto_size(inner_ctx))
                 .transpose()?
                 .unwrap_or_default();
-            let Size { w, h } = self.extra_dim();
-            size.w = size.w.saturating_add(w);
-            size.h = size.h.saturating_add(h);
+            let Vec2 { x: w, y: h } = self.extra_dim();
+            size.x = size.x.saturating_add(w);
+            size.y = size.y.saturating_add(h);
             Ok(size)
         })
     }
@@ -390,20 +390,20 @@ impl Block {
         let inner_sizing_arg = self.inner_sizing_arg(sizing);
         if let Some(inner) = &mut self.inner {
             let Area {
-                pos: Position { x, y },
-                size: Size { w, h },
+                pos: Vec2 { x, y },
+                size: Vec2 { x: w, y: h },
             } = area;
             inner.render(
                 ctx,
                 inner_sizing_arg,
                 Area {
-                    pos: Position {
+                    pos: Vec2 {
                         x: x.saturating_add(left.into()),
                         y: y.saturating_add(top.into()),
                     },
-                    size: Size {
-                        w: w.saturating_sub(right.into()),
-                        h: h.saturating_sub(bottom.into()),
+                    size: Vec2 {
+                        x: w.saturating_sub(right.into()),
+                        y: h.saturating_sub(bottom.into()),
                     },
                 },
             )?;
@@ -413,7 +413,7 @@ impl Block {
             let m = stylize(
                 self.border_set.horizontal.repeat(
                     area.size
-                        .w
+                        .x
                         .saturating_sub(left.into())
                         .saturating_sub(right.into())
                         .into(),
@@ -448,7 +448,7 @@ impl Block {
             let hi = area
                 .pos
                 .y
-                .saturating_add(area.size.h)
+                .saturating_add(area.size.y)
                 .saturating_sub(bottom.into());
             for y in lo..hi {
                 crossterm::queue!(
@@ -474,17 +474,17 @@ impl Block {
 }
 fn auto_size_invariants(
     sizing: SizingContext,
-    f: impl FnOnce() -> anyhow::Result<Size>,
-) -> anyhow::Result<Size> {
+    f: impl FnOnce() -> anyhow::Result<Vec2<u16>>,
+) -> anyhow::Result<Vec2<u16>> {
     if let (Some(w), Some(h)) = (sizing.div_w, sizing.div_h) {
-        return Ok(Size { w, h });
+        return Ok(Vec2 { x: w, y: h });
     }
     let mut size = f()?;
     if let Some(w) = sizing.div_w {
-        size.w = w;
+        size.x = w;
     }
     if let Some(h) = sizing.div_h {
-        size.h = h;
+        size.y = h;
     }
     Ok(size)
 }

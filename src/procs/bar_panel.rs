@@ -264,8 +264,8 @@ async fn run_instance_controller(
                     ctx,
                     tui::SizingContext {
                         font_size: sizes.font_size(),
-                        div_w: Some(size.w),
-                        div_h: Some(size.h),
+                        div_w: Some(size.x),
+                        div_h: Some(size.y),
                     },
                     tui::Area {
                         size,
@@ -358,7 +358,7 @@ fn to_tui(state: &BarState, monitor_name: &str) -> tui::Tui {
             continue;
         }
         subdiv.extend([
-            tui::StackItem::auto(tui::TagElem::new(
+            tui::StackItem::auto(tui::InteractElem::new(
                 BarInteractTarget::HyprWorkspace(ws.id.clone()).serialize_tag(),
                 tui::Text::plain(&ws.name).styled(tui::Style {
                     fg: ws.is_active.then_some(tui::Color::Green),
@@ -405,7 +405,7 @@ fn to_tui(state: &BarState, monitor_name: &str) -> tui::Tui {
             }
 
             subdiv.extend([
-                tui::StackItem::auto(tui::TagElem::new(
+                tui::StackItem::auto(tui::InteractElem::new(
                     BarInteractTarget::Tray(addr.clone()).serialize_tag(),
                     tui::Image {
                         data: png_data,
@@ -425,7 +425,7 @@ fn to_tui(state: &BarState, monitor_name: &str) -> tui::Tui {
             unmuted_sym: impl FnOnce() -> tui::StackItem,
             muted_sym: impl FnOnce() -> tui::StackItem,
         ) -> tui::StackItem {
-            tui::StackItem::auto(tui::TagElem::new(
+            tui::StackItem::auto(tui::InteractElem::new(
                 BarInteractTarget::Audio(kind).serialize_tag(),
                 tui::Stack::horizontal([
                     if muted { muted_sym() } else { unmuted_sym() },
@@ -488,11 +488,11 @@ fn to_tui(state: &BarState, monitor_name: &str) -> tui::Tui {
 
         subdiv.extend([
             tui::StackItem::spacing(SPACING),
-            tui::StackItem::auto(tui::TagElem::new(
+            tui::StackItem::auto(tui::InteractElem::new(
                 BarInteractTarget::Ppd.serialize_tag(),
                 tui::Text::plain(ppd_symbol),
             )),
-            tui::StackItem::auto(tui::TagElem::new(
+            tui::StackItem::auto(tui::InteractElem::new(
                 BarInteractTarget::Energy.serialize_tag(),
                 tui::Text::plain(energy),
             )),
@@ -502,7 +502,7 @@ fn to_tui(state: &BarState, monitor_name: &str) -> tui::Tui {
     if !state.time.is_empty() {
         subdiv.extend([
             tui::StackItem::spacing(SPACING),
-            tui::StackItem::auto(tui::TagElem::new(
+            tui::StackItem::auto(tui::InteractElem::new(
                 BarInteractTarget::Time.serialize_tag(),
                 tui::Text::plain(&state.time),
             )),
