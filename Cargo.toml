@@ -36,3 +36,4 @@ system-tray = { git = "https://github.com/maxdexh/system-tray", rev = "b044405df
 serde_json = "1.0.148"
 base64 = "0.22.1"
 tokio-util = { version = "0.7.18", features = ["rt", "time"] }
+unicode-segmentation = "1.12.0"

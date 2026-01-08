@@ -1,11 +1,12 @@
 use std::{collections::HashMap, sync::Arc};
 
+use anyhow::Context;
 use futures::{FutureExt, Stream};
 use system_tray::item::StatusNotifierItem;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt as _;
 
-use crate::utils::{ReloadRx, lossy_broadcast};
+use crate::utils::{ReloadRx, ResultExt, lossy_broadcast};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct TrayMenuInteract {
@@ -31,11 +32,11 @@ pub fn connect(
 
     let deferred_stream = tokio::spawn(system_tray::client::Client::new()).map(|res| {
         match res
-            .map_err(|err| log::error!("Failed to spawn task for system tray client: {err}"))
-            .ok()
+            .context("Failed to spawn task for system tray client")
+            .ok_or_log()
             .transpose()
-            .map_err(|err| log::error!("Failed to connect to system tray: {err}"))
-            .ok()
+            .context("Failed to connect to system tray")
+            .ok_or_log()
             .flatten()
         {
             Some(client) => {

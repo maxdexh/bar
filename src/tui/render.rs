@@ -2,6 +2,7 @@ use std::io::Write;
 
 use crate::tui::*;
 
+// FIXME: rework this
 #[derive(Clone, Copy, Debug)]
 pub struct SizingContext {
     pub font_size: Vec2<u16>,

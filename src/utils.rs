@@ -136,6 +136,31 @@ impl<T> Emit<T> for tokio::sync::broadcast::Sender<T> {
 pub trait SharedEmit<T>: Emit<T> + Clone + 'static + Send {}
 impl<S: Emit<T> + Clone + 'static + Send, T> SharedEmit<T> for S {}
 
+mod dyn_shared_emit {
+    use super::*;
+
+    pub trait IDynSharedEmit<T>: Emit<T> + 'static + Send {
+        fn clone_dyn(&self) -> Box<dyn IDynSharedEmit<T>>;
+    }
+    impl<T, E: SharedEmit<T>> IDynSharedEmit<T> for E {
+        fn clone_dyn(&self) -> Box<dyn IDynSharedEmit<T>> {
+            Box::new(self.clone())
+        }
+    }
+    pub struct DynSharedEmit<T>(Box<dyn IDynSharedEmit<T>>);
+    impl<T: 'static> Clone for DynSharedEmit<T> {
+        fn clone(&self) -> Self {
+            Self(self.0.clone_dyn())
+        }
+    }
+    impl<T> Emit<T> for DynSharedEmit<T> {
+        fn emit(&mut self, val: T) -> ControlFlow<()> {
+            self.0.emit(val)
+        }
+    }
+}
+pub use dyn_shared_emit::DynSharedEmit;
+
 pub trait ResultExt {
     type Ok;
     #[track_caller]

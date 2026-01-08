@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-// TODO: aarc?
-// TODO: ElementKind that maps monitor to element
+// FIXME: Split mod by elem kind
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct InteractTag(Arc<[u8]>);
@@ -223,6 +222,7 @@ impl StackItem {
     }
 }
 
+// FIXME: Remove
 // TODO: Tagging system for partial updates?
 #[derive(Debug)]
 pub struct Tui {

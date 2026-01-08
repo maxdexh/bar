@@ -6,14 +6,12 @@ use serde::{Deserialize, Serialize};
 use system_tray::item::Tooltip;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
-use tokio_util::time::FutureExt as _;
+use tokio_util::{sync::CancellationToken, time::FutureExt as _};
 
 use crate::{
-    clients::{
-        monitors::{MonitorEvent, MonitorInfo},
-        tray::{TrayMenuExt, TrayMenuInteract},
-    },
+    clients::tray::{TrayMenuExt, TrayMenuInteract},
     data::Position32,
+    monitors::{MonitorEvent, MonitorInfo},
     terminals::{SpawnTerm, TermEvent, TermId, TermMgrUpdate, TermUpdate},
     tui,
     utils::{Emit, ResultExt as _, SharedEmit, unb_chan, unb_rx_stream},
@@ -536,6 +534,7 @@ pub async fn run_menu_panel_manager(
                                     watcher_sock_path.into(),
                                 )],
                                 term_ev_tx,
+                                cancel: CancellationToken::new(),
                             }))
                             .is_break()
                         {

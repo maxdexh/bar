@@ -290,6 +290,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "unicode-segmentation",
  "zbus",
 ]
 

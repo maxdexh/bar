@@ -52,7 +52,7 @@ pub enum Axis {
     Y,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct RenderedLayout {
     pub widgets: Vec<(Area, InteractTag)>,
 }

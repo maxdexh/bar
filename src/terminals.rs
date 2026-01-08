@@ -15,7 +15,7 @@ use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle, time::FutureE
 
 use crate::{
     tui,
-    utils::{Emit, ResultExt, SharedEmit, unb_chan, unb_rx_stream},
+    utils::{Emit, ResultExt, SharedEmit, unb_chan},
 };
 
 // TODO: Consider using uuids
@@ -63,24 +63,42 @@ pub struct SpawnTerm {
     pub extra_args: Vec<OsString>,
     pub extra_envs: Vec<(OsString, OsString)>,
     pub term_ev_tx: tokio::sync::mpsc::UnboundedSender<TermEvent>,
+    pub cancel: CancellationToken,
 }
 
 pub const INTERNAL_ARG: &str = "internal-managed-terminal";
 
-struct TermInst {
-    upd_tx: tokio::sync::mpsc::UnboundedSender<TermUpdate>,
-    cancel: CancellationToken,
-}
-
 pub async fn run_term_manager(updates: impl Stream<Item = TermMgrUpdate> + Send + 'static) {
     tokio::pin!(updates);
 
-    let mut terminals = HashMap::new();
+    struct TermInst<E> {
+        upd_tx: E,
+        internal_id: u64,
+        cancel: CancellationToken,
+    }
 
-    while let Some(update) = updates.next().await {
+    let mut next_internal_id = 0u64;
+    let mut next_internal_id = || {
+        next_internal_id = next_internal_id.checked_add(1).unwrap();
+        next_internal_id
+    };
+
+    let mut terminals = HashMap::new();
+    let (cancelled_tx, mut cancelled_rx) = unb_chan();
+
+    loop {
+        let update = tokio::select! {
+            Some(update) = updates.next() => update,
+            Some((term_id, iid)) = cancelled_rx.next() => {
+                if let Some(&TermInst { internal_id, .. }) = terminals.get(&term_id) && iid == internal_id {
+                    _ = terminals.remove(&term_id);
+                }
+                continue;
+            }
+        };
         match update {
             TermMgrUpdate::TermUpdate(tid, tupd) => {
-                let Some(TermInst { upd_tx, cancel }) = terminals
+                let Some(TermInst { upd_tx, cancel, .. }) = terminals
                     .get_mut(&tid)
                     .with_context(|| {
                         format!("Cannot send update {tupd:?} to unknown terminal id {tid:?}")
@@ -90,24 +108,29 @@ pub async fn run_term_manager(updates: impl Stream<Item = TermMgrUpdate> + Send 
                     continue;
                 };
                 let is_shutdown = matches!(&tupd, TermUpdate::Shutdown);
-                if upd_tx.emit(tupd).is_break() || is_shutdown {
+                if Emit::emit(upd_tx, tupd).is_break() || is_shutdown {
                     cancel.cancel();
-                    terminals.remove(&tid);
                 }
             }
             TermMgrUpdate::SpawnPanel(spawn) => {
+                let internal_id = next_internal_id();
                 let term_id = spawn.term_id.clone();
 
-                let (upd_tx, upd_rx) = tokio::sync::mpsc::unbounded_channel();
-                let cancel_inst = CancellationToken::new();
-                if let Some(()) =
-                    spawn_inst(spawn, unb_rx_stream(upd_rx), cancel_inst.clone()).ok_or_log()
+                let cancel = spawn.cancel.clone();
+                let (upd_tx, upd_rx) = unb_chan();
+                if let Some(()) = spawn_inst(spawn, upd_rx, {
+                    let mut cancelled_tx = cancelled_tx.clone();
+                    let term_id = term_id.clone();
+                    move |()| cancelled_tx.emit((term_id.clone(), internal_id))
+                })
+                .ok_or_log()
                 {
                     let old = terminals.insert(
                         term_id,
                         TermInst {
                             upd_tx,
-                            cancel: cancel_inst,
+                            cancel,
+                            internal_id,
                         },
                     );
                     if let Some(old) = old {
@@ -124,9 +147,10 @@ fn spawn_inst(
         extra_args,
         extra_envs,
         term_ev_tx,
+        cancel: inst_tok,
     }: SpawnTerm,
     upd_rx: impl Stream<Item = TermUpdate> + 'static + Send,
-    inst_tok: CancellationToken,
+    mut on_exit: impl SharedEmit<()>,
 ) -> anyhow::Result<()> {
     let tmpdir = tempfile::tempdir()?;
     let sock_path = tmpdir.path().join("term-updates.sock");
@@ -143,35 +167,50 @@ fn spawn_inst(
         .stdout(std::io::stderr())
         .spawn()?;
 
-    let mgr = AbortOnDropHandle::new({
-        let inst_tok = inst_tok.clone();
-        tokio::spawn(async move {
-            run_term_inst_mgr(socket, term_ev_tx, upd_rx, inst_tok.clone())
-                .await
-                .context("Terminal instance failed")
-                .ok_or_log();
-            inst_tok.cancel();
-        })
-    });
     tokio::spawn(async move {
+        let mut mgr = AbortOnDropHandle::new(tokio::spawn(run_term_inst_mgr(
+            socket,
+            term_ev_tx,
+            upd_rx,
+            inst_tok.clone(),
+        )));
         tokio::select! {
             exit_res = child.wait() => {
-                inst_tok.cancel();
-                if let Err(err) = exit_res.context("Failed to wait for terminal exit") {
-                    log::error!("{err:?}");
-                    _ = child.kill().await;
-                }
+                exit_res.context("Failed to wait for terminal exit").ok_or_log();
             }
-            () = inst_tok.cancelled() => {
-                let res = child.wait().timeout(Duration::from_secs(10)).await;
-                let res: anyhow::Result<_> = (|| Ok(res??))();
-                if let Err(err) = res.context("Terminal instance failed to exit after shutdown") {
-                    log::error!("{err:?}");
-                }
+            () = inst_tok.cancelled() => {}
+            run_res = &mut mgr => {
+                run_res
+                    .context("Terminal instance failed")
+                    .ok_or_log();
             }
         };
-        mgr.abort();
+        _ = on_exit.emit(());
+        inst_tok.cancel();
+
+        // Allow the manager to send the shutdown to the child before
+        // deleting its socket and aborting its task.
+        let child_res = child.wait().timeout(Duration::from_secs(10)).await;
+        drop(mgr);
         drop(tmpdir);
+
+        match (|| anyhow::Ok(child_res??))()
+            .context("Terminal instance failed to exit after shutdown")
+            .ok_or_log()
+        {
+            Some(status) => {
+                if !status.success() {
+                    log::error!("Terminal exited with nonzero status {status}");
+                }
+            }
+            None => {
+                child
+                    .kill()
+                    .await
+                    .context("Failed to kill terminal")
+                    .ok_or_log();
+            }
+        }
     });
 
     Ok(())

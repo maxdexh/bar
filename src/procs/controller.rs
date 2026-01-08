@@ -38,7 +38,7 @@ pub async fn main() {
         (menu_upd_tx, menu_upd_rx) = unb_chan();
         (menu_ev_tx, menu_ev_rx) = unb_chan();
 
-        clients::monitors::connect(move |ev: clients::monitors::MonitorEvent| {
+        crate::monitors::connect(move |ev: crate::monitors::MonitorEvent| {
             let f1 = bar_monitor_tx.emit(ev.clone());
             let f2 = menu_monitor_tx.emit(ev);
             reload_tx();

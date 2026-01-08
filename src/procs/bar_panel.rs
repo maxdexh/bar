@@ -11,15 +11,15 @@ use serde::{Deserialize, Serialize};
 use system_tray::item::StatusNotifierItem;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
-use tokio_util::time::FutureExt;
+use tokio_util::{sync::CancellationToken, time::FutureExt};
 
 use crate::{
     clients::{
-        monitors::MonitorEvent,
         pulse::{PulseDeviceKind, PulseDeviceState, PulseState},
         upower::{BatteryState, EnergyState},
     },
     data::{BasicDesktopState, WorkspaceId},
+    monitors::MonitorEvent,
     terminals::{SpawnTerm, TermEvent, TermId, TermMgrUpdate, TermUpdate},
     tui,
     utils::{Emit, ResultExt as _, SharedEmit, unb_chan, unb_rx_stream},
@@ -166,6 +166,7 @@ pub async fn run_bar_panel_manager(
                                 ],
                                 extra_envs: Default::default(),
                                 term_ev_tx,
+                                cancel: CancellationToken::new(),
                             }))
                             .is_break()
                         {
