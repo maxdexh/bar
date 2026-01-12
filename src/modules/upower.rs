@@ -321,9 +321,7 @@ impl Module for Energy {
         tokio::pin!(rx);
         while let Some(energy) = rx.next().await {
             if !energy.should_show {
-                if act_tx.emit(ModuleAct::HideModule).is_break() {
-                    break;
-                }
+                act_tx.emit(ModuleAct::HideModule);
                 continue;
             }
 
@@ -343,9 +341,7 @@ impl Module for Energy {
                 )),
                 tui::StackItem::spacing(3),
             ]);
-            if act_tx.emit(ModuleAct::RenderAll(tui.into())).is_break() {
-                break;
-            }
+            act_tx.emit(ModuleAct::RenderAll(tui.into()));
         }
     }
 }

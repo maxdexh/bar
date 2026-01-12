@@ -298,7 +298,7 @@ pub async fn run_menu_panel_manager(
             for id in ids {
                 if let Some(inst) = instances.remove(&id) {
                     inst.inst_task.abort();
-                    term_upd_tx.emit(TermMgrUpdate::TermUpdate(id, TermUpdate::Shutdown))?
+                    term_upd_tx.emit(TermMgrUpdate::TermUpdate(id, TermUpdate::Shutdown));
                 }
             }
             ControlFlow::Continue(())
@@ -318,11 +318,9 @@ pub async fn run_menu_panel_manager(
                 if let Some(Current { term, .. }) = cur.take()
                     && let Some(inst) = instances.get_mut(&term)
                 {
-                    if inst.bar_upd_tx.emit(None).is_break() {
-                        shutdown(&mut instances, [term], &mut term_upd_tx)?;
-                    }
+                    inst.bar_upd_tx.emit(None);
                 }
-                ControlFlow::Continue(())
+                ControlFlow::<()>::Continue(())
             };
 
             match upd {
@@ -340,11 +338,7 @@ pub async fn run_menu_panel_manager(
                             break;
                         }
                     } else if let Some(inst) = instances.get_mut(&term_id) {
-                        if inst.bar_upd_tx.emit(None).is_break() {
-                            if shutdown(&mut instances, [term_id], &mut term_upd_tx).is_break() {
-                                break;
-                            }
-                        }
+                        inst.bar_upd_tx.emit(None);
                     }
                 }
                 Upd::Menu(MenuUpdate::SwitchSubject {
@@ -367,16 +361,7 @@ pub async fn run_menu_panel_manager(
                     }
                     if let Some(inst) = instances.get_mut(&term) {
                         let tui = to_tui(&new_menu);
-                        if inst
-                            .bar_upd_tx
-                            .emit(Some(PanelShow { tui, pos: location }))
-                            .is_break()
-                        {
-                            if shutdown(&mut instances, [term], &mut term_upd_tx).is_break() {
-                                break;
-                            }
-                            continue;
-                        }
+                        inst.bar_upd_tx.emit(Some(PanelShow { tui, pos: location }));
                     }
                     cur = Some(Current {
                         menu: new_menu,
@@ -438,7 +423,8 @@ pub async fn run_menu_panel_manager(
                                 let term_id = term_id.clone();
                                 move |upd| {
                                     term_upd_tx
-                                        .emit(TermMgrUpdate::TermUpdate(term_id.clone(), upd))
+                                        .emit(TermMgrUpdate::TermUpdate(term_id.clone(), upd));
+                                    todo!()
                                 }
                             },
                             term_ev_rx.map(|(_, a)| a), // FIXME: No.
@@ -472,73 +458,63 @@ pub async fn run_menu_panel_manager(
                                     }
                                 };
 
-                                if watcher_ev_tx
-                                    .emit((monitor_name.clone(), parsed))
-                                    .is_break()
-                                {
-                                    break;
-                                }
+                                watcher_ev_tx.emit((monitor_name.clone(), parsed));
                             }
                         });
-                        if term_upd_tx
-                            .emit(TermMgrUpdate::SpawnPanel(SpawnTerm {
-                                term_id: term_id.clone(),
-                                extra_args: vec![
-                                    {
-                                        let mut arg = OsString::from("-o=watcher=");
-                                        arg.push(watcher_py);
-                                        arg
-                                    },
-                                    format!("--output-name={}", monitor.name).into(),
-                                    // Configure remote control via socket
-                                    "-o=allow_remote_control=socket-only".into(),
-                                    "--listen-on=unix:/tmp/kitty-bar-menu-panel.sock".into(),
-                                    // Allow logging to $KITTY_STDIO_FORWARDED
-                                    "-o=forward_stdio=yes".into(),
-                                    // Do not use the system's kitty.conf
-                                    "--config=NONE".into(),
-                                    // Basic look of the menu
-                                    "-o=background_opacity=0.85".into(),
-                                    "-o=background=black".into(),
-                                    "-o=foreground=white".into(),
-                                    // location of the menu
-                                    "--edge=top".into(),
-                                    // disable hiding the mouse
-                                    "-o=mouse_hide_wait=0".into(),
-                                    // Window behavior of the menu panel. Makes panel
-                                    // act as an overlay on top of other windows.
-                                    // We do not want tilers to dedicate space to it.
-                                    // Taken from the args that quick-access-terminal uses.
-                                    "--exclusive-zone=0".into(),
-                                    "--override-exclusive-zone".into(),
-                                    "--layer=overlay".into(),
-                                    // Focus behavior of the panel. Since we cannot tell from
-                                    // mouse events alone when the cursor leaves the panel
-                                    // (since terminal mouse capture only gives us mouse
-                                    // events inside the panel), we need external support for
-                                    // hiding it automatically. We use a watcher to be able
-                                    // to reset the menu state when this happens.
-                                    "--focus-policy=on-demand".into(),
-                                    "--hide-on-focus-loss".into(),
-                                    // Since we control resizes from the program and not from
-                                    // a somewhat continuous drag-resize, debouncing between
-                                    // resize and reloads is completely inappropriate and
-                                    // just results in a larger delay between resize and
-                                    // the old menu content being replaced with the new one.
-                                    "-o=resize_debounce_time=0 0".into(),
-                                    // TODO: Mess with repaint_delay, input_delay
-                                ],
-                                extra_envs: vec![(
-                                    "BAR_MENU_WATCHER_SOCK".into(),
-                                    watcher_sock_path.into(),
-                                )],
-                                term_ev_tx,
-                                cancel: CancellationToken::new(),
-                            }))
-                            .is_break()
-                        {
-                            break;
-                        }
+                        term_upd_tx.emit(TermMgrUpdate::SpawnPanel(SpawnTerm {
+                            term_id: term_id.clone(),
+                            extra_args: vec![
+                                {
+                                    let mut arg = OsString::from("-o=watcher=");
+                                    arg.push(watcher_py);
+                                    arg
+                                },
+                                format!("--output-name={}", monitor.name).into(),
+                                // Configure remote control via socket
+                                "-o=allow_remote_control=socket-only".into(),
+                                "--listen-on=unix:/tmp/kitty-bar-menu-panel.sock".into(),
+                                // Allow logging to $KITTY_STDIO_FORWARDED
+                                "-o=forward_stdio=yes".into(),
+                                // Do not use the system's kitty.conf
+                                "--config=NONE".into(),
+                                // Basic look of the menu
+                                "-o=background_opacity=0.85".into(),
+                                "-o=background=black".into(),
+                                "-o=foreground=white".into(),
+                                // location of the menu
+                                "--edge=top".into(),
+                                // disable hiding the mouse
+                                "-o=mouse_hide_wait=0".into(),
+                                // Window behavior of the menu panel. Makes panel
+                                // act as an overlay on top of other windows.
+                                // We do not want tilers to dedicate space to it.
+                                // Taken from the args that quick-access-terminal uses.
+                                "--exclusive-zone=0".into(),
+                                "--override-exclusive-zone".into(),
+                                "--layer=overlay".into(),
+                                // Focus behavior of the panel. Since we cannot tell from
+                                // mouse events alone when the cursor leaves the panel
+                                // (since terminal mouse capture only gives us mouse
+                                // events inside the panel), we need external support for
+                                // hiding it automatically. We use a watcher to be able
+                                // to reset the menu state when this happens.
+                                "--focus-policy=on-demand".into(),
+                                "--hide-on-focus-loss".into(),
+                                // Since we control resizes from the program and not from
+                                // a somewhat continuous drag-resize, debouncing between
+                                // resize and reloads is completely inappropriate and
+                                // just results in a larger delay between resize and
+                                // the old menu content being replaced with the new one.
+                                "-o=resize_debounce_time=0 0".into(),
+                                // TODO: Mess with repaint_delay, input_delay
+                            ],
+                            extra_envs: vec![(
+                                "BAR_MENU_WATCHER_SOCK".into(),
+                                watcher_sock_path.into(),
+                            )],
+                            term_ev_tx,
+                            cancel: CancellationToken::new(),
+                        }));
 
                         let old = instances.insert(
                             term_id,
@@ -658,9 +634,7 @@ async fn run_instance_mgr(
                         kind,
                         payload: MenuInteractTarget::from_tag(&tag),
                     };
-                    if ev_tx.emit(MenuEvent::Interact(interact)).is_break() {
-                        break;
-                    }
+                    ev_tx.emit(MenuEvent::Interact(interact));
                 }
             }
         }
@@ -718,33 +692,23 @@ async fn run_instance_mgr(
                     let margin_left = (f64::from(mleft) / scale) as u32;
                     let margin_right = (f64::from(mright) / scale) as u32;
 
-                    if term_upd_tx
-                        .emit(TermUpdate::RemoteControl(vec![
-                            "resize-os-window".into(),
-                            "--incremental".into(),
-                            "--action=os-panel".into(),
-                            format!("margin-left={margin_left}").into(),
-                            format!("margin-right={margin_right}").into(),
-                            format!("lines={}", tui_size_cache.y).into(),
-                        ]))
-                        .is_break()
-                    {
-                        break;
-                    };
+                    term_upd_tx.emit(TermUpdate::RemoteControl(vec![
+                        "resize-os-window".into(),
+                        "--incremental".into(),
+                        "--action=os-panel".into(),
+                        format!("margin-left={margin_left}").into(),
+                        format!("margin-right={margin_right}").into(),
+                        format!("lines={}", tui_size_cache.y).into(),
+                    ]));
                 }
             }
 
             // TODO: be smarter about when to run this
             let action = if show.is_some() { "show" } else { "hide" };
-            if term_upd_tx
-                .emit(TermUpdate::RemoteControl(vec![
-                    "resize-os-window".into(),
-                    format!("--action={}", action).into(),
-                ]))
-                .is_break()
-            {
-                break;
-            }
+            term_upd_tx.emit(TermUpdate::RemoteControl(vec![
+                "resize-os-window".into(),
+                format!("--action={}", action).into(),
+            ]));
         }
         if render_ready
             && let Some(Show {
@@ -784,11 +748,8 @@ async fn run_instance_mgr(
                     *rendered = true;
                 }
             }
-            if term_upd_tx.emit(TermUpdate::Print(buf)).is_break()
-                || term_upd_tx.emit(TermUpdate::Flush).is_break()
-            {
-                break;
-            }
+            term_upd_tx.emit(TermUpdate::Print(buf));
+            term_upd_tx.emit(TermUpdate::Flush);
         }
     }
 }

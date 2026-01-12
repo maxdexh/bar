@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    ops::ControlFlow,
     sync::Arc,
     time::Duration,
 };
@@ -63,14 +62,13 @@ pub async fn run_bar_panel_manager(
             ids: impl IntoIterator<Item = TermId>,
             instances: &mut HashMap<TermId, Instance>,
             term_upd_tx: &mut impl Emit<TermMgrUpdate>,
-        ) -> ControlFlow<()> {
+        ) {
             for id in ids {
                 if let Some(inst) = instances.remove(&id) {
                     inst.inst_task.abort();
-                    term_upd_tx.emit(TermMgrUpdate::TermUpdate(id, TermUpdate::Shutdown))?
+                    term_upd_tx.emit(TermMgrUpdate::TermUpdate(id, TermUpdate::Shutdown));
                 }
             }
-            ControlFlow::Continue(())
         }
         loop {
             let upd = tokio::select! {
@@ -94,12 +92,10 @@ pub async fn run_bar_panel_manager(
                             shutdown_queue.push(term_id.clone());
                         }
                     }
-                    if shutdown(shutdown_queue, &mut instances, &mut term_upd_tx).is_break() {
-                        break;
-                    }
+                    shutdown(shutdown_queue, &mut instances, &mut term_upd_tx);
                 }
                 Upd::Monitor(ev) => {
-                    if shutdown(
+                    shutdown(
                         {
                             let shutdown_monitors: HashSet<_> = ev
                                 .removed()
@@ -116,11 +112,7 @@ pub async fn run_bar_panel_manager(
                         },
                         &mut instances,
                         &mut term_upd_tx,
-                    )
-                    .is_break()
-                    {
-                        break;
-                    }
+                    );
 
                     for monitor in ev.added_or_changed() {
                         let bar_info = BarEventInfo {
@@ -131,46 +123,37 @@ pub async fn run_bar_panel_manager(
                         let (term_ev_tx, term_ev_rx) = unb_chan();
                         let listener = subtasks.spawn(run_instance_controller(
                             monitor.name.clone(),
-                            {
-                                let mut bar_ev_tx = bar_ev_tx.clone();
-                                move |ev| bar_ev_tx.emit((bar_info.clone(), ev))
-                            },
+                            bar_ev_tx.clone().with(move |ev| (bar_info.clone(), ev)),
                             bar_upd_rx,
                             {
-                                let mut term_upd_tx = term_upd_tx.clone();
                                 let term_id = term_id.clone();
-                                move |upd| {
-                                    term_upd_tx
-                                        .emit(TermMgrUpdate::TermUpdate(term_id.clone(), upd))
-                                }
+                                term_upd_tx.clone().with(move |upd| {
+                                    TermMgrUpdate::TermUpdate(term_id.clone(), upd)
+                                })
                             },
                             term_ev_rx.map(|(_, a)| a),
                         ));
-                        if term_upd_tx
-                            .emit(TermMgrUpdate::SpawnPanel(SpawnTerm {
-                                term_id: term_id.clone(),
-                                extra_args: vec![
-                                    format!("--output-name={}", monitor.name).into(),
-                                    // Allow logging to $KITTY_STDIO_FORWARDED
-                                    "-o=forward_stdio=yes".into(),
-                                    // Do not use the system's kitty.conf
-                                    "--config=NONE".into(),
-                                    // Basic look of the bar
-                                    "-o=foreground=white".into(),
-                                    "-o=background=black".into(),
-                                    // location of the bar
-                                    format!("--edge={}", super::EDGE).into(),
-                                    // disable hiding the mouse
-                                    "-o=mouse_hide_wait=0".into(),
-                                ],
-                                extra_envs: Default::default(),
-                                term_ev_tx,
-                                cancel: CancellationToken::new(),
-                            }))
-                            .is_break()
-                        {
-                            break;
-                        }
+                        term_upd_tx.emit(TermMgrUpdate::SpawnPanel(SpawnTerm {
+                            term_id: term_id.clone(),
+                            extra_args: vec![
+                                format!("--output-name={}", monitor.name).into(),
+                                // Allow logging to $KITTY_STDIO_FORWARDED
+                                "-o=forward_stdio=yes".into(),
+                                // Do not use the system's kitty.conf
+                                "--config=NONE".into(),
+                                // Basic look of the bar
+                                "-o=foreground=white".into(),
+                                "-o=background=black".into(),
+                                // location of the bar
+                                format!("--edge={}", super::EDGE).into(),
+                                // disable hiding the mouse
+                                "-o=mouse_hide_wait=0".into(),
+                            ],
+                            extra_envs: Default::default(),
+                            term_ev_tx,
+                            cancel: CancellationToken::new(),
+                        }));
+
                         let old = instances.insert(
                             term_id,
                             Instance {
@@ -245,9 +228,7 @@ async fn run_instance_controller(
                             None => BarInteractTarget::None,
                         },
                     };
-                    if ev_tx.emit(BarEvent::Interact(interact)).is_break() {
-                        break;
-                    }
+                    ev_tx.emit(BarEvent::Interact(interact));
                 }
             }
             Inc::Term(TermEvent::Sizes(new_sizes)) => {
@@ -275,11 +256,8 @@ async fn run_instance_controller(
                 Err(err) => log::error!("Failed to draw: {err}"),
                 Ok(new_layout) => layout = new_layout,
             }
-            if term_upd_tx.emit(TermUpdate::Print(buf)).is_break()
-                || term_upd_tx.emit(TermUpdate::Flush).is_break()
-            {
-                break;
-            }
+            term_upd_tx.emit(TermUpdate::Print(buf));
+            term_upd_tx.emit(TermUpdate::Flush);
         }
     }
 }

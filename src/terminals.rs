@@ -98,7 +98,8 @@ pub async fn run_term_manager(updates: impl Stream<Item = TermMgrUpdate> + Send 
                     continue;
                 };
                 let is_shutdown = matches!(&tupd, TermUpdate::Shutdown);
-                if Emit::emit(upd_tx, tupd).is_break() || is_shutdown {
+                Emit::emit(upd_tx, tupd);
+                if is_shutdown {
                     terminals.remove(&tid);
                 }
             }
@@ -110,9 +111,10 @@ pub async fn run_term_manager(updates: impl Stream<Item = TermMgrUpdate> + Send 
                 let (upd_tx, upd_rx) = unb_chan();
 
                 let res = spawn_inst(spawn, upd_rx, {
-                    let mut cancelled_tx = cancelled_tx.clone();
                     let term_id = term_id.clone();
-                    move |()| cancelled_tx.emit((term_id.clone(), internal_id))
+                    cancelled_tx
+                        .clone()
+                        .with(move |()| (term_id.clone(), internal_id))
                 });
                 if res.ok_or_log().is_some() {
                     terminals.insert(
@@ -133,7 +135,7 @@ fn spawn_inst(
         term_id,
         extra_args,
         extra_envs,
-        mut term_ev_tx,
+        term_ev_tx,
         cancel: inst_tok,
     }: SpawnTerm,
     upd_rx: impl Stream<Item = TermUpdate> + 'static + Send,
@@ -157,7 +159,7 @@ fn spawn_inst(
     tokio::spawn(async move {
         let mut mgr = AbortOnDropHandle::new(tokio::spawn(run_term_inst_mgr(
             socket,
-            move |ev| term_ev_tx.emit((term_id.clone(), ev)),
+            term_ev_tx.with(move |ev| (term_id.clone(), ev)),
             upd_rx,
             inst_tok.clone(),
         )));
@@ -172,7 +174,7 @@ fn spawn_inst(
                     .ok_or_log();
             }
         };
-        _ = on_exit.emit(());
+        on_exit.emit(());
         inst_tok.cancel();
 
         // Allow the manager to send the shutdown to the child before
@@ -273,8 +275,10 @@ async fn term_proc_main_inner(term_id: TermId) -> anyhow::Result<()> {
 
     let init_sizes = tui::Sizes::query()?;
 
-    if ev_tx.emit(TermEvent::Sizes(init_sizes)).is_break() {
-        anyhow::bail!("Failed to send initial font size while starting {term_id:?}. Exiting.");
+    if let Err(err) = ev_tx.try_emit(TermEvent::Sizes(init_sizes)) {
+        return Err(err).with_context(|| {
+            format!("Failed to send initial font size while starting {term_id:?}. Exiting.")
+        });
     }
 
     let proc_tok_clone = proc_tok.clone();
@@ -288,13 +292,9 @@ async fn term_proc_main_inner(term_id: TermId) -> anyhow::Result<()> {
                     if let crossterm::event::Event::Resize(_, _) = &ev
                         && let Ok(sizes) = tui::Sizes::query().map_err(|err| log::error!("{err}"))
                     {
-                        if ev_tx.emit(TermEvent::Sizes(sizes)).is_break() {
-                            break;
-                        }
+                        ev_tx.emit(TermEvent::Sizes(sizes));
                     }
-                    if ev_tx.emit(TermEvent::Crossterm(ev)).is_break() {
-                        break;
-                    }
+                    ev_tx.emit(TermEvent::Crossterm(ev));
                 }
             }
         }
@@ -391,9 +391,7 @@ async fn read_cobs_sock<T: serde::de::DeserializeOwned>(
                 );
             }
             Ok(ev) => {
-                if tx.emit(ev).is_break() {
-                    break;
-                }
+                tx.emit(ev);
             }
         }
 

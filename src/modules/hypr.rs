@@ -284,12 +284,7 @@ impl Module for Hypr {
                             .map(|(k, v)| (k, tui::Stack::horizontal(v).into()))
                             .collect();
 
-                        if act_tx
-                            .emit(ModuleAct::RenderByMonitor(by_monitor))
-                            .is_break()
-                        {
-                            break;
-                        }
+                        act_tx.emit(ModuleAct::RenderByMonitor(by_monitor));
                     }
                     Upd::Update(upd) => match upd {
                         ModuleUpd::Interact(ModuleInteract {

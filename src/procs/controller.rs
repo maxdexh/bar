@@ -1,5 +1,3 @@
-use std::ops::ControlFlow;
-
 use crate::tui::MouseButton;
 use crate::{
     modules::{self, tray::TrayState},
@@ -8,10 +6,21 @@ use crate::{
         menu_panel::{Menu, MenuEvent, MenuUpdate},
     },
     tui,
-    utils::{Emit, ReloadTx, dump_stream, unb_chan},
+    utils::{Emit, ReloadTx, unb_chan},
 };
+use futures::Stream;
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
+
+async fn dump_stream<T>(mut dst: impl Emit<T>, src: impl Stream<Item = T>) {
+    tokio::pin!(src);
+    while let Some(item) = src.next().await {
+        if let Err(err) = dst.try_emit(item) {
+            log::warn!("{err}");
+            break;
+        }
+    }
+}
 
 // TODO: Draw on the controller, send rendered buffer to each panel
 // TODO: Add network module
@@ -22,7 +31,7 @@ pub async fn main() {
     let mut client_tasks = JoinSet::<()>::new();
     let mut important_tasks = JoinSet::<()>::new(); // FIXME: Exit on mgr exit
 
-    let mut reload_tx = ReloadTx::new();
+    let reload_tx = ReloadTx::new();
     let reload_rx = reload_tx.subscribe();
 
     let (mut bar_upd_tx, bar_ev_rx);
@@ -40,14 +49,10 @@ pub async fn main() {
         (menu_ev_tx, menu_ev_rx) = unb_chan();
 
         crate::monitors::connect(move |ev: crate::monitors::MonitorEvent| {
-            let f1 = bar_monitor_tx.emit(ev.clone());
-            let f2 = menu_monitor_tx.emit(ev);
-            reload_tx.reload();
-            if f1.is_break() || f2.is_break() {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
+            let f1 = bar_monitor_tx.try_emit(ev.clone());
+            let f2 = menu_monitor_tx.try_emit(ev);
+            f1?;
+            f2
         });
         important_tasks.spawn(crate::procs::bar_panel::run_bar_panel_manager(
             bar_monitor_rx,
@@ -116,12 +121,7 @@ pub async fn main() {
         // in that case.
         match controller_update {
             Upd::Tray(state) => {
-                if bar_upd_tx
-                    .emit(BarUpdate::SysTray(state.items.clone()))
-                    .is_break()
-                {
-                    break;
-                }
+                bar_upd_tx.emit(BarUpdate::SysTray(state.items.clone()));
                 tray_state = state;
             }
 
@@ -142,7 +142,7 @@ pub async fn main() {
                     monitor: monitor.clone(),
                 };
 
-                let flow = match (&kind, target) {
+                match (&kind, target) {
                     (IK::Hover, IT::Tray(addr)) => match tray_state
                         .items
                         .iter()
@@ -167,59 +167,37 @@ pub async fn main() {
                     }
 
                     (IK::Click(MouseButton::Left), IT::Ppd) => {
-                        _ = ppd_switch_tx.emit(modules::ppd::CycleProfile);
-                        ControlFlow::Continue(())
+                        ppd_switch_tx.emit(modules::ppd::CycleProfile);
                     }
                     (IK::Click(MouseButton::Left), IT::Audio(target)) => {
-                        if audio_upd_tx
-                            .emit(modules::pulse::PulseUpdate {
-                                target,
-                                kind: modules::pulse::PulseUpdateKind::ToggleMute,
-                            })
-                            .is_break()
-                        {
-                            // TODO: Restart client
-                        }
-                        ControlFlow::Continue(())
+                        audio_upd_tx.emit(modules::pulse::PulseUpdate {
+                            target,
+                            kind: modules::pulse::PulseUpdateKind::ToggleMute,
+                        });
                     }
                     (IK::Click(MouseButton::Right), IT::Audio(target)) => {
-                        if audio_upd_tx
-                            .emit(modules::pulse::PulseUpdate {
-                                target,
-                                kind: modules::pulse::PulseUpdateKind::ResetVolume,
-                            })
-                            .is_break()
-                        {
-                            // TODO: Restart client
-                        }
-                        ControlFlow::Continue(())
+                        audio_upd_tx.emit(modules::pulse::PulseUpdate {
+                            target,
+                            kind: modules::pulse::PulseUpdateKind::ResetVolume,
+                        });
                     }
                     (IK::Scroll(direction), IT::Audio(target)) => {
-                        if audio_upd_tx
-                            .emit(modules::pulse::PulseUpdate {
-                                target,
-                                kind: modules::pulse::PulseUpdateKind::VolumeDelta(
-                                    2 * match direction {
-                                        tui::Direction::Up => 1,
-                                        tui::Direction::Down => -1,
-                                        tui::Direction::Left => -1,
-                                        tui::Direction::Right => 1,
-                                    },
-                                ),
-                            })
-                            .is_break()
-                        {
-                            // TODO: Restart client
-                        }
-                        ControlFlow::Continue(())
+                        audio_upd_tx.emit(modules::pulse::PulseUpdate {
+                            target,
+                            kind: modules::pulse::PulseUpdateKind::VolumeDelta(
+                                2 * match direction {
+                                    tui::Direction::Up => 1,
+                                    tui::Direction::Down => -1,
+                                    tui::Direction::Left => -1,
+                                    tui::Direction::Right => 1,
+                                },
+                            ),
+                        });
                     }
 
                     // TODO: Implement more interactions
                     (IK::Hover, _) => menu_upd_tx.emit(MenuUpdate::UnfocusMenu),
                     (IK::Click(_) | IK::Scroll(_), _) => menu_upd_tx.emit(MenuUpdate::Hide),
-                };
-                if flow.is_break() {
-                    break;
                 }
             }
             Upd::Menu(menu) => match menu {

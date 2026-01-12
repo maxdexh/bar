@@ -67,25 +67,20 @@ pub async fn main() {
     let energy = ModuleId::new("energy");
     let tray = ModuleId::new("tray");
 
-    if bar_upd_tx
-        .emit(BarMgrUpd::LoadModules(crate::panels::bar::LoadModules {
-            start: [
-                botch_module(&hypr, modules::hypr::Hypr),
-                botch_module(&clock, modules::time::Time),
-                botch_module(&pulse, modules::pulse::Pulse),
-                botch_module(&ppd, modules::ppd::PowerProfiles),
-                botch_module(&energy, modules::upower::Energy),
-                botch_module(&tray, modules::tray::Tray),
-            ]
-            .into_iter()
-            .collect(),
-            left: [hypr].into(),
-            right: [tray, pulse, ppd, energy, clock].into(),
-        }))
-        .is_break()
-    {
-        unreachable!()
-    }
+    bar_upd_tx.emit(BarMgrUpd::LoadModules(crate::panels::bar::LoadModules {
+        start: [
+            botch_module(&hypr, modules::hypr::Hypr),
+            botch_module(&clock, modules::time::Time),
+            botch_module(&pulse, modules::pulse::Pulse),
+            botch_module(&ppd, modules::ppd::PowerProfiles),
+            botch_module(&energy, modules::upower::Energy),
+            botch_module(&tray, modules::tray::Tray),
+        ]
+        .into_iter()
+        .collect(),
+        left: [hypr].into(),
+        right: [tray, pulse, ppd, energy, clock].into(),
+    }));
 
     if let Some(res) = tasks.join_next().await {
         res.context("Task failed").ok_or_log();

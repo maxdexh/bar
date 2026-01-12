@@ -15,7 +15,7 @@ pub struct RenderCtx<'a, W> {
 }
 
 impl Tui {
-    pub fn calc_size(&mut self, sizing: SizingContext) -> anyhow::Result<Vec2<u16>> {
+    pub fn calc_size(&self, sizing: SizingContext) -> anyhow::Result<Vec2<u16>> {
         self.root.calc_auto_size(sizing)
     }
     pub fn render(

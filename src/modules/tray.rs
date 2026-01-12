@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::Context;
 use futures::{FutureExt, Stream};
 use system_tray::item::StatusNotifierItem;
-use tokio::{sync::broadcast, task::JoinSet};
+use tokio::sync::broadcast;
 use tokio_stream::StreamExt as _;
 
 use crate::{
@@ -164,7 +164,7 @@ impl Module for Tray {
         &self,
         ModuleArgs {
             mut act_tx,
-            mut upd_rx,
+            upd_rx,
             reload_rx,
             ..
         }: ModuleArgs,
@@ -230,9 +230,7 @@ impl Module for Tray {
                         }
                     }
                     let tui = tui::Stack::horizontal(parts);
-                    if act_tx.emit(ModuleAct::RenderAll(tui.into())).is_break() {
-                        break;
-                    }
+                    act_tx.emit(ModuleAct::RenderAll(tui.into()));
                 }
                 Upd::Module(ModuleUpd::Interact(ModuleInteract {
                     location,
@@ -279,9 +277,9 @@ impl Module for Tray {
                             }
                             tui::InteractKind::Click(tui::MouseButton::Right) => {
                                 let Some(TrayMenuExt {
-                                    id,
                                     menu_path,
                                     submenus,
+                                    ..
                                 }) = cur_menus.iter().find(|(a, _)| a == addr).map(|(_, it)| it)
                                 else {
                                     log::error!("Unknown tray addr {addr}");
@@ -307,17 +305,12 @@ impl Module for Tray {
                             }
                             _ => continue,
                         };
-                        if act_tx
-                            .emit(ModuleAct::OpenMenu(OpenMenu {
-                                monitor: payload.monitor,
-                                tui,
-                                pos: location,
-                                menu_kind,
-                            }))
-                            .is_break()
-                        {
-                            break;
-                        }
+                        act_tx.emit(ModuleAct::OpenMenu(OpenMenu {
+                            monitor: payload.monitor,
+                            tui,
+                            pos: location,
+                            menu_kind,
+                        }));
                     }
                 }
             }

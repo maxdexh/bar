@@ -8,7 +8,7 @@ use tokio_stream::StreamExt as _;
 use crate::{
     modules::prelude::*,
     tui,
-    utils::{Emit, ReloadRx, ResultExt, SharedEmit, WatchRx, fused_watch_tx, unb_chan, watch_chan},
+    utils::{Emit, ReloadRx, ResultExt, SharedEmit, WatchRx, unb_chan, watch_chan},
 };
 
 pub struct CycleProfile;
@@ -62,14 +62,10 @@ async fn run(
             Upd::ProfileChanged(profile) => {
                 cur_profile = profile;
 
-                if profile_tx.emit(cur_profile.clone()).is_break() {
-                    break;
-                }
+                profile_tx.emit(cur_profile.clone());
             }
             Upd::Reload(()) => {
-                if profile_tx.emit(cur_profile.clone()).is_break() {
-                    break;
-                }
+                profile_tx.emit(cur_profile.clone());
             }
             Upd::CycleProfile(CycleProfile) => {
                 let Ok(profiles) = proxy
@@ -139,7 +135,7 @@ fn connect2(reload_rx: ReloadRx) -> (impl SharedEmit<CycleProfile>, WatchRx<Arc<
     let (profile_tx, profile_rx) = watch_chan(Default::default());
 
     tokio::spawn(async move {
-        match run(fused_watch_tx(profile_tx), switch_rx, reload_rx).await {
+        match run(profile_tx, switch_rx, reload_rx).await {
             Err(err) => log::error!("Failed to connect to ppd: {err}"),
             Ok(()) => log::warn!("Ppd client exited"),
         }
@@ -177,9 +173,8 @@ impl Module for PowerProfiles {
                 let tui =
                     tui::InteractElem::new(Arc::new(PowerProfiles), tui::Text::plain(ppd_symbol))
                         .into();
-                if act_tx.emit(ModuleAct::RenderAll(tui)).is_break() {
-                    break;
-                }
+
+                act_tx.emit(ModuleAct::RenderAll(tui))
             }
         });
 
@@ -193,9 +188,7 @@ impl Module for PowerProfiles {
 
                         match kind {
                             tui::InteractKind::Click(tui::MouseButton::Left) => {
-                                if cycle_tx.emit(CycleProfile).is_break() {
-                                    break;
-                                }
+                                cycle_tx.emit(CycleProfile);
                             }
                             _ => {
                                 // TODO

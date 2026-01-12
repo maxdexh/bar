@@ -1,33 +1,27 @@
 use super::prelude::*;
-use std::{ops::ControlFlow, time::Duration};
+use std::time::Duration;
 
 use chrono::Timelike;
 use futures::Stream;
 
 use crate::{
     tui,
-    utils::{CancelDropGuard, Emit, ReloadRx, fused_watch_tx, stream_from_fn, watch_chan},
+    utils::{CancelDropGuard, Emit, ReloadRx, stream_from_fn, watch_chan},
 };
 
 const MIN_SLEEP: Duration = Duration::from_millis(250);
 
-async fn send_time(
-    tx: &mut impl Emit<String>,
-    time: chrono::DateTime<chrono::Local>,
-) -> ControlFlow<()> {
+fn send_time(tx: &mut impl Emit<String>, time: chrono::DateTime<chrono::Local>) {
     tx.emit(time.format("%H:%M %d/%m").to_string())
 }
 
 pub fn connect(mut reload_rx: ReloadRx) -> impl Stream<Item = String> {
-    let (tx, mut rx) = watch_chan(Default::default());
-    let mut tx = fused_watch_tx(tx);
+    let (mut tx, mut rx) = watch_chan(Default::default());
     tokio::spawn(run(tx.clone()));
     tokio::spawn(async move {
         loop {
             reload_rx.wait().await;
-            if send_time(&mut tx, chrono::Local::now()).await.is_break() {
-                break;
-            }
+            send_time(&mut tx, chrono::Local::now());
         }
     });
     stream_from_fn(async move || {
@@ -42,9 +36,7 @@ async fn run(mut tx: impl Emit<String>) {
         let now = chrono::Local::now();
         let minute = now.minute();
         if minute != last_minutes {
-            if send_time(&mut tx, now).await.is_break() {
-                break;
-            }
+            send_time(&mut tx, now);
             last_minutes = minute;
         } else {
             tokio::time::sleep(
@@ -72,9 +64,7 @@ impl Module for Time {
             let minute = now.minute();
             if last_minutes != Some(minute) {
                 let tui = tui::Text::plain(now.format("%H:%M %d/%m").to_string());
-                if act_tx.emit(ModuleAct::RenderAll(tui.into())).is_break() {
-                    break;
-                }
+                act_tx.emit(ModuleAct::RenderAll(tui.into()));
 
                 last_minutes = Some(minute);
             } else {

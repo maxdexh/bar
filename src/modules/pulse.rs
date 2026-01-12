@@ -154,7 +154,7 @@ fn run_blocking(tx: impl SharedEmit<PulseState>, mut reload_rx: ReloadRx) -> any
         };
 
         let mut doit = move |volume: &ChannelVolumes, muted: bool| {
-            _ = tx.emit({
+            tx.emit({
                 let mut state = state.borrow_mut();
                 let dstate = match kind {
                     PulseDeviceKind::Sink => &mut state.sink,
@@ -374,9 +374,7 @@ impl Module for Pulse {
                     ),
                     tui::StackItem::spacing(3),
                 ]);
-                if act_tx.emit(ModuleAct::RenderAll(tui.into())).is_break() {
-                    break;
-                }
+                act_tx.emit(ModuleAct::RenderAll(tui.into()));
             }
         });
         tasks.spawn(async move {
@@ -390,7 +388,7 @@ impl Module for Pulse {
                         let Some(&target) = payload.tag.downcast_ref::<PulseDeviceKind>() else {
                             continue;
                         };
-                        let cf = tx.emit(PulseUpdate {
+                        tx.emit(PulseUpdate {
                             target,
                             kind: match kind {
                                 tui::InteractKind::Click(tui::MouseButton::Left) => {
@@ -412,9 +410,6 @@ impl Module for Pulse {
                                 _ => continue,
                             },
                         });
-                        if cf.is_break() {
-                            break;
-                        }
                     }
                 }
             }

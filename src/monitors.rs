@@ -110,10 +110,8 @@ pub fn connect(mut tx: impl SharedEmit<MonitorEvent>) {
         loop {
             match state.refresh() {
                 Ok(ev) => {
-                    if let Some(ev) = ev
-                        && tx.emit(ev).is_break()
-                    {
-                        break;
+                    if let Some(ev) = ev {
+                        tx.emit(ev)
                     }
                 }
                 Err(err) => {
