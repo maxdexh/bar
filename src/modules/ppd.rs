@@ -1,101 +1,17 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use futures::Stream;
-use tokio::task::JoinSet;
+use anyhow::Context;
+use tokio::sync::Semaphore;
 use tokio_stream::StreamExt as _;
 
 use crate::{
     modules::prelude::*,
     tui,
-    utils::{Emit, ReloadRx, ResultExt, SharedEmit, WatchRx, unb_chan, watch_chan},
+    utils::{
+        Emit, LazyTask, LazyTaskHandle, ReloadRx, ReloadTx, ResultExt, SharedEmit, WatchRx,
+        await_first, watch_chan,
+    },
 };
-
-pub struct CycleProfile;
-pub fn connect(
-    reload_rx: ReloadRx,
-) -> (impl SharedEmit<CycleProfile>, impl Stream<Item = Arc<str>>) {
-    let (switch_tx, switch_rx) = unb_chan();
-    let (profile_tx, profile_rx) = unb_chan();
-
-    tokio::spawn(async move {
-        match run(profile_tx, switch_rx, reload_rx).await {
-            Err(err) => log::error!("Failed to connect to ppd: {err}"),
-            Ok(()) => log::warn!("Ppd client exited"),
-        }
-    });
-
-    (switch_tx, profile_rx)
-}
-
-async fn run(
-    mut profile_tx: impl SharedEmit<Arc<str>>,
-    switch_rx: impl Stream<Item = CycleProfile>,
-    reload_rx: ReloadRx,
-) -> Result<()> {
-    let connection = zbus::Connection::system().await?;
-    let proxy = dbus::PpdProxy::new(&connection).await?;
-
-    enum Upd {
-        ProfileChanged(Arc<str>),
-        CycleProfile(CycleProfile),
-        Reload(()),
-    }
-    let active_profiles = futures::StreamExt::filter_map(
-        proxy.receive_active_profile_changed().await,
-        |opt| async move {
-            opt.get()
-                .await
-                .map_err(|err| log::error!("On active profile change: {err}"))
-                .ok()
-                .map(|it| Upd::ProfileChanged(it.into()))
-        },
-    );
-    let updates = active_profiles
-        .merge(switch_rx.map(Upd::CycleProfile))
-        .merge(reload_rx.into_stream().map(Upd::Reload));
-    tokio::pin!(updates);
-
-    let mut cur_profile = Arc::<str>::from(proxy.active_profile().await?);
-    while let Some(update) = updates.next().await {
-        match update {
-            Upd::ProfileChanged(profile) => {
-                cur_profile = profile;
-
-                profile_tx.emit(cur_profile.clone());
-            }
-            Upd::Reload(()) => {
-                profile_tx.emit(cur_profile.clone());
-            }
-            Upd::CycleProfile(CycleProfile) => {
-                let Ok(profiles) = proxy
-                    .profiles()
-                    .await
-                    .map_err(|err| log::error!("Failed to get profiles: {err}"))
-                else {
-                    continue;
-                };
-                if profiles.is_empty() {
-                    log::error!("Somehow got no ppd profiles. Ignoring request.");
-                    continue;
-                }
-                let idx = profiles
-                    .iter()
-                    .position(|p| p.profile.as_str() == &cur_profile as &str)
-                    .map_or(0, |i| i + 1)
-                    % profiles.len();
-
-                if let Err(err) = proxy
-                    .set_active_profile(profiles.into_iter().nth(idx).unwrap().profile)
-                    .await
-                {
-                    log::error!("Failed to set profile: {err}");
-                }
-            }
-        }
-    }
-    Ok(())
-}
 
 mod dbus {
     use serde::{Deserialize, Serialize};
@@ -130,77 +46,185 @@ mod dbus {
         pub cpu_driver: Option<String>,
     }
 }
-fn connect2(reload_rx: ReloadRx) -> (impl SharedEmit<CycleProfile>, WatchRx<Arc<str>>) {
-    let (switch_tx, switch_rx) = unb_chan();
-    let (profile_tx, profile_rx) = watch_chan(Default::default());
 
-    tokio::spawn(async move {
-        match run(profile_tx, switch_rx, reload_rx).await {
-            Err(err) => log::error!("Failed to connect to ppd: {err}"),
-            Ok(()) => log::warn!("Ppd client exited"),
-        }
-    });
-
-    (switch_tx, profile_rx)
+#[derive(Clone)]
+struct PpdBackend {
+    cycle: Arc<Semaphore>,
+    profile_rx: WatchRx<Arc<str>>,
+    reload_tx: ReloadTx,
 }
-
 // FIXME: Refactor
-#[derive(Debug)]
-pub struct PowerProfiles;
-impl Module for PowerProfiles {
-    async fn run_instance(
-        &self,
+pub struct PpdModule {
+    background: LazyTask<PpdBackend>,
+}
+impl PpdModule {
+    pub fn new() -> Self {
+        Self {
+            background: LazyTask::new(),
+        }
+    }
+    async fn enter_backend(&self) -> LazyTaskHandle<PpdBackend> {
+        self.background
+            .enter(|| async {
+                let cycle = Arc::new(Semaphore::new(0));
+                let (profile_tx, profile_rx) = watch_chan(Default::default());
+                let reload_tx = ReloadTx::new();
+                (
+                    Self::run_backend(cycle.clone(), profile_tx, reload_tx.subscribe()),
+                    PpdBackend {
+                        cycle,
+                        profile_rx,
+                        reload_tx,
+                    },
+                )
+            })
+            .await
+    }
+    async fn run_backend(
+        cycle_rx: Arc<Semaphore>,
+        mut profile_tx: impl SharedEmit<Arc<str>>,
+        mut reload_rx: ReloadRx,
+    ) {
+        let Some(connection) = zbus::Connection::system().await.ok_or_log() else {
+            return;
+        };
+        let Some(proxy) = dbus::PpdProxy::new(&connection).await.ok_or_log() else {
+            return;
+        };
+
+        let profiles_fut = async {
+            let profile_rx = proxy.receive_active_profile_changed().await;
+            tokio::pin!(profile_rx);
+
+            loop {
+                tokio::select! {
+                    Some(_) = profile_rx.next() => (),
+                    _ = reload_rx.wait() => (),
+                };
+
+                let Some(profile) = proxy.active_profile().await.ok_or_log() else {
+                    continue;
+                };
+
+                profile_tx.emit(profile.into());
+            }
+        };
+
+        let cycle_fut = async {
+            loop {
+                let Some(perm) = cycle_rx.acquire().await.ok_or_log() else {
+                    break;
+                };
+                perm.forget();
+                let mut steps = 1;
+                while let Ok(perm) = cycle_rx.try_acquire() {
+                    perm.forget();
+                    steps += 1;
+                }
+
+                let Some((profiles, cur)) =
+                    futures::future::try_join(proxy.profiles(), proxy.active_profile())
+                        .await
+                        .context("Failed to get ppd profiles")
+                        .ok_or_log()
+                else {
+                    continue;
+                };
+
+                if profiles.is_empty() {
+                    log::error!("No ppd profiles found");
+                    continue;
+                }
+
+                let idx = profiles
+                    .iter()
+                    .position(|p| p.profile.as_str() == &cur as &str)
+                    .map_or(0, |i| i + steps)
+                    % profiles.len();
+                let profile = profiles.into_iter().nth(idx).expect("Index < Length");
+
+                proxy
+                    .set_active_profile(profile.profile)
+                    .await
+                    .context("Failed to set ppd profile")
+                    .ok_or_log();
+            }
+        };
+
+        await_first!(profiles_fut, cycle_fut);
+    }
+}
+impl Module for PpdModule {
+    async fn run_module_instance(
+        self: Arc<Self>,
         ModuleArgs {
-            mut act_tx,
+            act_tx,
             mut upd_rx,
-            reload_rx,
+            mut reload_rx,
             ..
         }: ModuleArgs,
         _cancel: crate::utils::CancelDropGuard,
     ) -> () {
-        let (mut cycle_tx, mut profile_rx) = connect2(reload_rx);
+        let handle = self.enter_backend().await;
+        let PpdBackend {
+            cycle: cycle_tx,
+            profile_rx,
+            mut reload_tx,
+        } = handle.backend().clone();
 
-        let mut tasks = JoinSet::new();
-        tasks.spawn(async move {
+        let profile_ui_fut = async {
+            let mut profile_rx = profile_rx.clone();
+            let mut act_tx = act_tx.clone();
             while profile_rx.changed().await.is_ok() {
-                let ppd_symbol = match &profile_rx.borrow_and_update() as &str {
-                    "balanced" => " ",
-                    "performance" => " ",
-                    "power-saver" => " ",
-                    _ => "",
-                };
-
-                let tui =
-                    tui::InteractElem::new(Arc::new(PowerProfiles), tui::Text::plain(ppd_symbol))
-                        .into();
-
-                act_tx.emit(ModuleAct::RenderAll(tui))
+                act_tx.emit(ModuleAct::RenderAll(
+                    tui::InteractElem::new(
+                        Arc::new(PpdInteractTag),
+                        tui::Text::plain(match &profile_rx.borrow_and_update() as &str {
+                            "balanced" => " ",
+                            "performance" => " ", // FIXME: Center
+                            "power-saver" => " ",
+                            _ => "",
+                        }),
+                    )
+                    .into(),
+                ))
             }
-        });
+        };
 
-        tasks.spawn(async move {
+        let reload_fut = reload_tx.reload_on(&mut reload_rx);
+
+        let interact_fut = async {
+            let profile_rx = profile_rx.clone();
+            let mut act_tx = act_tx.clone();
             while let Some(upd) = upd_rx.next().await {
                 match upd {
-                    ModuleUpd::Interact(ModuleInteract { payload, kind, .. }) => {
-                        let Some(PowerProfiles) = payload.tag.downcast_ref() else {
+                    ModuleUpd::Interact(ModuleInteract {
+                        payload: ModuleInteractPayload { tag, monitor },
+                        kind,
+                        location,
+                    }) => {
+                        let Some(PpdInteractTag {}) = tag.downcast_ref() else {
                             continue;
                         };
 
                         match kind {
                             tui::InteractKind::Click(tui::MouseButton::Left) => {
-                                cycle_tx.emit(CycleProfile);
+                                cycle_tx.add_permits(1);
                             }
-                            _ => {
-                                // TODO
-                            }
+                            _ => act_tx.emit(ModuleAct::OpenMenu(OpenMenu {
+                                monitor,
+                                tui: tui::Text::plain(&profile_rx.borrow() as &str).into(),
+                                pos: location,
+                                menu_kind: MenuKind::Tooltip,
+                            })),
                         }
                     }
                 }
             }
-        });
+        };
 
-        if let Some(res) = tasks.join_next().await {
-            res.context("Ppd module failed").ok_or_log();
-        }
+        await_first!(profile_ui_fut, reload_fut, interact_fut);
     }
 }
+#[derive(Debug)]
+struct PpdInteractTag;

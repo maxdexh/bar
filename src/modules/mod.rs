@@ -52,8 +52,8 @@ pub mod prelude {
     pub type ModuleActTx = crate::panels::ModuleActTxImpl;
     pub type ModuleUpdRx = crate::panels::ModuleUpdRxImpl;
     pub trait Module: 'static + Send + Sync {
-        fn run_instance(
-            &self,
+        fn run_module_instance(
+            self: Arc<Self>,
             _: ModuleArgs,
             _cancel: CancelDropGuard,
         ) -> impl Future<Output = ()> + Send;

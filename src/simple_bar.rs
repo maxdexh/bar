@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Context;
 use tokio::task::JoinSet;
 use tokio_util::time::FutureExt;
@@ -18,7 +20,7 @@ pub struct ModuleArgs {
     _p: (),
 }
 
-fn botch_module(mid: &ModuleId, module: impl Module) -> (ModuleId, BarMgrModuleParams) {
+fn botch_module(mid: &ModuleId, module: Arc<impl Module>) -> (ModuleId, BarMgrModuleParams) {
     let start = move |args| {
         let BarMgrModuleArgs {
             act_tx,
@@ -29,7 +31,7 @@ fn botch_module(mid: &ModuleId, module: impl Module) -> (ModuleId, BarMgrModuleP
 
         tokio::spawn(async move {
             module
-                .run_instance(
+                .run_module_instance(
                     ModuleArgs {
                         act_tx,
                         upd_rx,
@@ -69,12 +71,12 @@ pub async fn main() {
 
     bar_upd_tx.emit(BarMgrUpd::LoadModules(crate::panels::LoadModules {
         start: [
-            botch_module(&hypr, modules::hypr::Hypr),
-            botch_module(&clock, modules::time::Time),
-            botch_module(&pulse, modules::pulse::Pulse),
-            botch_module(&ppd, modules::ppd::PowerProfiles),
-            botch_module(&energy, modules::upower::Energy),
-            botch_module(&tray, modules::tray::Tray),
+            botch_module(&hypr, Arc::new(modules::hypr::HyprModule::new())),
+            botch_module(&clock, Arc::new(modules::time::TimeModule)),
+            botch_module(&pulse, Arc::new(modules::pulse::PulseModule)),
+            botch_module(&ppd, Arc::new(modules::ppd::PpdModule::new())),
+            botch_module(&energy, Arc::new(modules::upower::EnergyModule)),
+            botch_module(&tray, Arc::new(modules::tray::TrayModule::new())),
         ]
         .into_iter()
         .collect(),

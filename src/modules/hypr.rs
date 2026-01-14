@@ -1,52 +1,88 @@
-use crate::data::{BasicDesktopState, BasicWorkspace, WorkspaceId};
+use crate::data::{BasicDesktopState, BasicWorkspace};
 use crate::modules::prelude::*;
 use crate::tui;
-use crate::utils::Emit;
-use crate::utils::{ReloadRx, ResultExt, WatchRx, lossy_broadcast, watch_chan};
+use crate::utils::{
+    Emit, LazyTaskHandle, ReloadRx, ReloadTx, SharedEmit, WatchRx, WatchTx, watch_chan,
+};
+use crate::utils::{LazyTask, ResultExt};
 use anyhow::Context;
 use hyprland::data::*;
 use hyprland::shared::{HyprData, HyprDataVec};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::broadcast;
-use tokio::task::JoinSet;
 use tokio_stream::StreamExt;
 
 // TODO: Detailed state (for menu), including clients
-// TODO: channel to receive full refetch request
-pub fn connect(reload_rx: ReloadRx) -> WatchRx<BasicDesktopState> {
-    type HyprEvent = hyprland::event_listener::Event;
-    let ev_tx = broadcast::Sender::new(100);
 
-    let ev_rx = lossy_broadcast(ev_tx.subscribe());
-    let (ws_tx, ws_rx) = watch_chan(BasicDesktopState::default());
-    tokio::spawn(async move {
+type HyprBackend = (WatchRx<BasicDesktopState>, ReloadTx);
+pub struct HyprModule {
+    updater: LazyTask<HyprBackend>,
+}
+
+// reqs:
+// - Instantiation does nothing.
+// - There is no leaked task if non-running instance is leaked
+// - Updater task is shared between all instances
+// - Once all instances stop running, updater task does too
+// - If all instances go out of scope, then no resources are used. Including Arcs
+//
+// Logical consequeces
+// - We need to do module tracking in the controller. We can drop unused modules though.
+// - We want a way to create an updater task in `run_instance` such that reentering does not spawn
+//   a new one. We can use a tokio mutex for this without any downsides because `run_instance`
+//   already needs to run in its own task. the updater task can take an `Arc<Self>` because it will
+//   be controlled through handles.
+
+impl HyprModule {
+    pub fn new() -> Self {
+        Self {
+            updater: LazyTask::new(),
+        }
+    }
+
+    async fn enter_backend(&self) -> LazyTaskHandle<HyprBackend> {
+        self.updater
+            .enter(async || {
+                let (tx, rx) = watch_chan(BasicDesktopState::default());
+                let reload_tx = ReloadTx::new();
+                (
+                    Self::run_backend(tx, reload_tx.subscribe()),
+                    (rx, reload_tx),
+                )
+            })
+            .await
+    }
+
+    async fn run_backend(
+        mut basic_tx: impl SharedEmit<BasicDesktopState>,
+        mut reload_rx: ReloadRx,
+    ) {
+        let ev_rx = hyprland::event_listener::EventStream::new()
+            .filter_map(|res| res.context("Hyprland error").ok_or_log());
         tokio::pin!(ev_rx);
 
         let mut workspaces = Default::default();
         let mut monitors = HashMap::new();
 
-        // TODO: Test if this is correct. If there is no event that needs to update both,
-        // divide them into two seperate tasks.
-        let fetch_rx = ev_rx
-            .map(|ev| match ev {
-                HyprEvent::MonitorAdded(_) => (false, true),
-                HyprEvent::ActiveMonitorChanged(_) => (false, true),
-                HyprEvent::MonitorRemoved(_) => (false, true),
-                HyprEvent::WorkspaceChanged(_) => (false, true),
+        loop {
+            type HyprEvent = hyprland::event_listener::Event;
+            let (upd_wss, upd_mons) = tokio::select! {
+                () = reload_rx.wait() => (true, true),
+                Some(ev) = ev_rx.next() => match ev {
+                    HyprEvent::MonitorAdded(_) => (false, true),
+                    HyprEvent::ActiveMonitorChanged(_) => (false, true),
+                    HyprEvent::MonitorRemoved(_) => (false, true),
+                    HyprEvent::WorkspaceChanged(_) => (false, true),
 
-                HyprEvent::WorkspaceMoved(_) => (true, false),
-                HyprEvent::WorkspaceAdded(_) => (true, false),
-                HyprEvent::WorkspaceDeleted(_) => (true, false),
-                HyprEvent::WorkspaceRenamed(_) => (true, false),
+                    HyprEvent::WorkspaceMoved(_) => (true, false),
+                    HyprEvent::WorkspaceAdded(_) => (true, false),
+                    HyprEvent::WorkspaceDeleted(_) => (true, false),
+                    HyprEvent::WorkspaceRenamed(_) => (true, false),
 
-                _ => (false, false),
-            })
-            .merge(reload_rx.into_stream().map(|_| (true, true)))
-            .filter(|&(f1, f2)| f1 || f2);
+                    _ => continue,
+                },
+            };
 
-        tokio::pin!(fetch_rx);
-        while let Some((upd_wss, upd_mons)) = fetch_rx.next().await {
             futures::future::join(
                 async {
                     if upd_wss {
@@ -108,163 +144,47 @@ pub fn connect(reload_rx: ReloadRx) -> WatchRx<BasicDesktopState> {
                     },
                 )
                 .collect();
+
             workspaces.sort_unstable_by(|w1, w2| w1.name.cmp(&w2.name));
-            if ws_tx.send(BasicDesktopState { workspaces }).is_err() {
-                break;
-            }
+            basic_tx.emit(BasicDesktopState { workspaces });
         }
-    });
-
-    tokio::spawn(async move {
-        let mut hypr_events = hyprland::event_listener::EventStream::new();
-        while let Some(event) = hypr_events.next().await {
-            match event {
-                Ok(ev) => {
-                    if ev_tx.send(ev).is_err() {
-                        log::warn!("Hyprland event channel closed");
-                        return;
-                    }
-                }
-                Err(err) => log::error!("Error with hypr event: {err}"),
-            }
-        }
-        log::warn!("Hyprland event stream closed");
-    });
-
-    ws_rx
+    }
 }
-
-pub struct Hypr;
-impl Module for Hypr {
-    // FIXME: Refactor
-    async fn run_instance(
-        &self,
+impl Module for HyprModule {
+    async fn run_module_instance(
+        self: Arc<Self>,
         ModuleArgs {
             mut act_tx,
             mut upd_rx,
-            reload_rx,
+            mut reload_rx,
             ..
         }: ModuleArgs,
         _cancel: crate::utils::CancelDropGuard,
     ) {
-        let mut join = JoinSet::new();
+        let updater_handle = self.enter_backend().await;
+        let (mut basic_rx, mut reload_tx) = updater_handle.backend().clone();
 
-        type HyprEvent = hyprland::event_listener::Event;
-
-        let (ws_tx, mut ws_rx) = watch_chan(BasicDesktopState::default());
-        join.spawn(async move {
-            let ev_rx = hyprland::event_listener::EventStream::new()
-                .filter_map(|res| res.context("Hyprland error").ok_or_log());
-            tokio::pin!(ev_rx);
-
-            let mut workspaces = Default::default();
-            let mut monitors = HashMap::new();
-
-            // TODO: Test if this is correct. If there is no event that needs to update both,
-            // divide them into two seperate tasks.
-            let fetch_rx = ev_rx
-                .map(|ev| match ev {
-                    HyprEvent::MonitorAdded(_) => (false, true),
-                    HyprEvent::ActiveMonitorChanged(_) => (false, true),
-                    HyprEvent::MonitorRemoved(_) => (false, true),
-                    HyprEvent::WorkspaceChanged(_) => (false, true),
-
-                    HyprEvent::WorkspaceMoved(_) => (true, false),
-                    HyprEvent::WorkspaceAdded(_) => (true, false),
-                    HyprEvent::WorkspaceDeleted(_) => (true, false),
-                    HyprEvent::WorkspaceRenamed(_) => (true, false),
-
-                    _ => (false, false),
-                })
-                .merge(reload_rx.into_stream().map(|_| (true, true)))
-                .filter(|&(f1, f2)| f1 || f2);
-
-            tokio::pin!(fetch_rx);
-            while let Some((upd_wss, upd_mons)) = fetch_rx.next().await {
-                futures::future::join(
-                    async {
-                        if upd_wss {
-                            let Ok(wss) = Workspaces::get_async()
-                                .await
-                                .map_err(|err| log::error!("Failed to fetch workspaces: {err}"))
-                            else {
-                                return;
-                            };
-                            workspaces = wss.to_vec();
-                        }
-                    },
-                    async {
-                        if upd_mons {
-                            let Ok(mrs) = Monitors::get_async()
-                                .await
-                                .map_err(|err| log::error!("Failed to fetch monitors: {err}"))
-                            else {
-                                return;
-                            };
-                            for Monitor {
-                                id,
-                                name,
-                                active_workspace,
-                                ..
-                            } in mrs
-                            {
-                                monitors
-                                    .entry(id)
-                                    .and_modify(|(mname, mactive)| {
-                                        *mactive = active_workspace.id;
-                                        if mname as &str != name.as_str() {
-                                            *mname = Arc::<str>::from(name.as_str());
-                                        }
-                                    })
-                                    .or_insert_with(|| (name.into(), active_workspace.id));
-                            }
-                        }
-                    },
-                )
-                .await;
-
-                let mut workspaces: Vec<_> = workspaces
-                    .iter()
-                    .map(
-                        |Workspace {
-                             id,
-                             name,
-                             monitor_id,
-                             ..
-                         }| {
-                            let mon = monitor_id.and_then(|id| monitors.get(&id));
-                            BasicWorkspace {
-                                id: id.to_string().into(),
-                                name: name.as_str().into(),
-                                monitor: mon.as_ref().map(|(name, _)| name.clone()),
-                                is_active: mon.is_some_and(|(_, active_id)| active_id == id),
-                            }
-                        },
-                    )
-                    .collect();
-                workspaces.sort_unstable_by(|w1, w2| w1.name.cmp(&w2.name));
-                if ws_tx.send(BasicDesktopState { workspaces }).is_err() {
-                    break;
+        enum Upd {
+            State,
+            Update(ModuleUpd),
+        }
+        loop {
+            let upd = tokio::select! {
+                res = basic_rx.changed() => match res {
+                    Ok(()) => Upd::State,
+                    Err(_) => break,
+                },
+                () = reload_rx.wait() => {
+                    reload_tx.reload();
+                    continue;
                 }
-            }
-        });
-
-        join.spawn(async move {
-            enum Upd<'a> {
-                State(&'a BasicDesktopState),
-                Update(ModuleUpd),
-            }
-            loop {
-                let upd = tokio::select! {
-                    res = ws_rx.changed() => match res {
-                        Ok(()) => Upd::State(&ws_rx.borrow_and_update()),
-                        Err(_) => break,
-                    },
-                    Some(upd) = upd_rx.next() => Upd::Update(upd),
-                };
-                match upd {
-                    Upd::State(state) => {
-                        let mut by_monitor = HashMap::new();
+                Some(upd) = upd_rx.next() => Upd::Update(upd),
+            };
+            match upd {
+                Upd::State => {
+                    let mut by_monitor = HashMap::new();
+                    {
+                        let state = basic_rx.borrow_and_update();
                         for ws in state.workspaces.iter() {
                             let Some(monitor) = ws.monitor.clone() else {
                                 continue;
@@ -279,29 +199,25 @@ impl Module for Hypr {
                             )));
                             wss.push(tui::StackItem::spacing(1));
                         }
-                        let by_monitor = by_monitor
-                            .into_iter()
-                            .map(|(k, v)| (k, tui::Stack::horizontal(v).into()))
-                            .collect();
-
-                        act_tx.emit(ModuleAct::RenderByMonitor(by_monitor));
                     }
-                    Upd::Update(upd) => match upd {
-                        ModuleUpd::Interact(ModuleInteract {
-                            payload: ModuleInteractPayload { tag, .. },
-                            kind: tui::InteractKind::Click(tui::MouseButton::Left),
-                            ..
-                        }) => {
-                            // TODO: Switch ws
-                        }
-                        ModuleUpd::Interact(_) => {}
-                    },
-                }
-            }
-        });
+                    let by_monitor = by_monitor
+                        .into_iter()
+                        .map(|(k, v)| (k, tui::Stack::horizontal(v).into()))
+                        .collect();
 
-        if let Some(res) = join.join_next().await {
-            res.context("Hyprland module failed").ok_or_log();
+                    act_tx.emit(ModuleAct::RenderByMonitor(by_monitor));
+                }
+                Upd::Update(upd) => match upd {
+                    ModuleUpd::Interact(ModuleInteract {
+                        payload: ModuleInteractPayload { tag, .. },
+                        kind: tui::InteractKind::Click(tui::MouseButton::Left),
+                        ..
+                    }) => {
+                        // TODO: Switch ws
+                    }
+                    ModuleUpd::Interact(_) => {}
+                },
+            }
         }
     }
 }

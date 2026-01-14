@@ -1,147 +1,31 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use futures::{FutureExt, Stream};
 use system_tray::item::StatusNotifierItem;
-use tokio::sync::broadcast;
+use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
 
 use crate::{
-    modules::prelude::Module,
+    modules::prelude::*,
     tui,
-    utils::{Emit, ReloadRx, ResultExt, lossy_broadcast},
+    utils::{
+        Emit, LazyTask, LazyTaskHandle, ReloadRx, ReloadTx, ResultExt, SharedEmit, UnbTx, WatchRx,
+        await_first, lossy_broadcast, unb_chan, watch_chan,
+    },
 };
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug)]
 pub struct TrayMenuInteract {
     pub addr: Arc<str>,
     pub menu_path: Arc<str>,
     pub id: i32,
 }
 
-type TrayEvent = system_tray::client::Event;
-#[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
+#[derive(Debug, Default)]
 pub struct TrayState {
-    pub items: Arc<[(Arc<str>, StatusNotifierItem)]>,
-    pub menus: Arc<[(Arc<str>, TrayMenuExt)]>,
-}
-
-pub fn connect(
-    reload_rx: ReloadRx,
-) -> (
-    broadcast::Sender<TrayMenuInteract>, // FIXME: no
-    impl Stream<Item = TrayState>,
-) {
-    let (interact_tx, interact_rx) = broadcast::channel(50);
-
-    let deferred_stream = tokio::spawn(system_tray::client::Client::new()).map(|res| {
-        match res
-            .context("Failed to spawn task for system tray client")
-            .ok_or_log()
-            .transpose()
-            .context("Failed to connect to system tray")
-            .ok_or_log()
-            .flatten()
-        {
-            Some(client) => {
-                let stream = mk_stream(client.items(), client.subscribe(), reload_rx);
-                tokio::spawn(run_interaction(client, interact_rx));
-                stream
-            }
-            None => mk_stream(Default::default(), broadcast::channel(1).1, reload_rx),
-        }
-    });
-    (
-        interact_tx,
-        // TODO: is there a better way of turning impl Future<Output: Stream> into a stream?
-        futures::StreamExt::flatten(deferred_stream.into_stream()),
-    )
-}
-
-async fn run_interaction(
-    client: system_tray::client::Client,
-    interact_rx: broadcast::Receiver<TrayMenuInteract>,
-) {
-    let interacts = lossy_broadcast(interact_rx);
-    tokio::pin!(interacts);
-    while let Some(interact) = interacts.next().await {
-        let TrayMenuInteract {
-            addr,
-            menu_path,
-            id,
-        } = interact;
-
-        if let Err(err) = client
-            .activate(system_tray::client::ActivateRequest::MenuItem {
-                address: str::to_owned(&addr),
-                menu_path: str::to_owned(&menu_path),
-                submenu_id: id,
-            })
-            .await
-        {
-            log::error!("Failed to send ActivateRequest: {err}");
-        }
-    }
-    log::warn!("Tray interact stream was closed");
-}
-
-fn mk_stream(
-    items_mutex: Arc<std::sync::Mutex<system_tray::data::BaseMap>>,
-    client_rx: broadcast::Receiver<TrayEvent>,
-    reload_rx: ReloadRx,
-) -> impl Stream<Item = TrayState> {
-    let menu_paths = Arc::new(std::sync::Mutex::new(HashMap::new()));
-
-    let handle_event = move |ev| {
-        let items_mutex = items_mutex.clone();
-        let menu_paths = menu_paths.clone();
-
-        tokio::task::spawn_blocking(move || {
-            let mut menu_paths = menu_paths.lock().unwrap();
-            let items_lock = items_mutex.lock().unwrap();
-
-            if let Some(system_tray::client::Event::Update(
-                addr,
-                system_tray::client::UpdateEvent::MenuConnect(menu_path),
-            )) = &ev
-            {
-                log::trace!("Connected menu {menu_path} for addr {addr}");
-                menu_paths.insert(
-                    Arc::<str>::from(addr.as_str()),
-                    Arc::<str>::from(menu_path.as_str()),
-                );
-            }
-            let mut items = Vec::with_capacity(items_lock.len());
-            let mut menus = Vec::with_capacity(items_lock.len());
-            for (addr, (item, menu)) in &*items_lock {
-                let addr = Arc::<str>::from(addr.as_str());
-                if let Some(&system_tray::menu::TrayMenu { id, ref submenus }) = menu.as_ref() {
-                    menus.push((
-                        addr.clone(),
-                        TrayMenuExt {
-                            id,
-                            menu_path: menu_paths.get(&addr as &str).cloned(),
-                            submenus: submenus.clone(),
-                        },
-                    ));
-                }
-                items.push((addr, item.clone()));
-            }
-            TrayState {
-                items: items.into(),
-                menus: menus.into(),
-            }
-        })
-    };
-
-    lossy_broadcast(client_rx)
-        .map(Some)
-        .merge(reload_rx.into_stream().map(|()| None))
-        .then(handle_event)
-        .filter_map(|res| {
-            res.map_err(|err| log::error!("Failed to join blocking task: {err}"))
-                .ok()
-        })
+    pub items: HashMap<Arc<str>, StatusNotifierItem>,
+    pub menus: HashMap<Arc<str>, TrayMenuExt>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
@@ -151,106 +35,291 @@ pub struct TrayMenuExt {
     pub submenus: Vec<system_tray::menu::MenuItem>,
 }
 
-use crate::modules::prelude::*;
-// FIXME: Refactor
-pub struct Tray;
-
 #[derive(Debug)]
-struct Tag {
+struct TrayInteractTag {
     addr: Arc<str>,
 }
-impl Module for Tray {
-    async fn run_instance(
-        &self,
+
+// FIXME: Refactor
+#[derive(Clone)]
+struct TrayBackend {
+    state_rx: WatchRx<TrayState>,
+    menu_interact_tx: UnbTx<Arc<TrayMenuInteract>>,
+    reload_tx: ReloadTx,
+}
+pub struct TrayModule {
+    background: LazyTask<TrayBackend>,
+}
+impl TrayModule {
+    pub fn new() -> Self {
+        Self {
+            background: LazyTask::new(),
+        }
+    }
+    async fn enter_backend(&self) -> LazyTaskHandle<TrayBackend> {
+        self.background
+            .enter(|| async {
+                let (state_tx, state_rx) = watch_chan(Default::default());
+                let (menu_interact_tx, menu_interact_rx) = unb_chan();
+                let reload_tx = ReloadTx::new();
+                (
+                    Self::run_backend(state_tx, menu_interact_rx, reload_tx.subscribe()),
+                    TrayBackend {
+                        state_rx,
+                        menu_interact_tx,
+                        reload_tx,
+                    },
+                )
+            })
+            .await
+    }
+    async fn run_backend(
+        state_tx: impl SharedEmit<TrayState>,
+        menu_interact_rx: impl Stream<Item = Arc<TrayMenuInteract>> + 'static + Send,
+        mut reload_rx: ReloadRx,
+    ) {
+        let client = loop {
+            match system_tray::client::Client::new().await {
+                Ok(it) => break it,
+                res @ Err(_) => {
+                    res.context("Failed to connect to system tray").ok_or_log();
+
+                    let sleep = tokio::time::sleep(Duration::from_secs(90));
+                    let reload = reload_rx.wait();
+                    await_first!(sleep, reload);
+                }
+            }
+        };
+
+        let mut tasks = JoinSet::<()>::new();
+
+        {
+            let (mut tx, rx) = unb_chan();
+
+            // Minimize lagged events
+            let event_rx = lossy_broadcast(client.subscribe());
+            tasks.spawn(async move {
+                tokio::pin!(event_rx);
+                while let Some(ev) = event_rx.next().await {
+                    tx.emit(ev);
+                }
+            });
+
+            tasks.spawn(Self::run_state_fetcher(
+                client.items(),
+                rx,
+                state_tx,
+                reload_rx,
+            ));
+        }
+        tasks.spawn(Self::run_menu_interaction(client, menu_interact_rx));
+
+        if let Some(res @ Err(_)) = tasks.join_next().await {
+            res.context("Systray module failed").ok_or_log();
+        }
+    }
+    async fn run_state_fetcher(
+        state_mutex: Arc<std::sync::Mutex<system_tray::data::BaseMap>>,
+        client_rx: impl Stream<Item = system_tray::client::Event>,
+        mut state_tx: impl SharedEmit<TrayState>,
+        mut reload_rx: ReloadRx,
+    ) {
+        let fetch_blocking = move || {
+            let lock = state_mutex.lock().unwrap_or_else(|it| it.into_inner());
+
+            let mut items = HashMap::with_capacity(lock.len());
+            let mut menus = HashMap::with_capacity(lock.len());
+
+            for (addr, (item, menu)) in &*lock {
+                let addr = Arc::<str>::from(addr.as_str());
+                if let Some(menu) = &menu {
+                    menus.insert(
+                        addr.clone(),
+                        TrayMenuExt {
+                            id: menu.id,
+                            menu_path: None,
+                            submenus: menu.submenus.clone(),
+                        },
+                    );
+                }
+                items.insert(addr, item.clone());
+            }
+            (items, menus)
+        };
+        let fetch = || async {
+            tokio::task::spawn_blocking(fetch_blocking.clone())
+                .await
+                .ok_or_log()
+        };
+
+        let mut menu_paths = HashMap::new();
+
+        tokio::pin!(client_rx);
+        loop {
+            let mut ev_opt = tokio::select! {
+                ev = client_rx.next() => {
+                    if ev.is_none() {
+                        log::warn!("Systray client disconnected");
+                        break
+                    }
+                    ev
+                }
+                () = reload_rx.wait() => None,
+            };
+            while let Some(ev) = ev_opt {
+                if let system_tray::client::Event::Update(
+                    addr,
+                    system_tray::client::UpdateEvent::MenuConnect(menu_path),
+                ) = ev
+                {
+                    log::trace!("Connected menu {menu_path} for addr {addr}");
+                    menu_paths.insert(addr, Arc::<str>::from(menu_path));
+                }
+                ev_opt = client_rx.next().now_or_never().flatten();
+            }
+
+            let Some((items, mut menus)) = fetch().await else {
+                continue;
+            };
+            menu_paths.retain(|addr, menu_path| {
+                if let Some(menu) = menus.get_mut(addr as &str) {
+                    menu.menu_path = Some(menu_path.clone());
+                    true
+                } else {
+                    false
+                }
+            });
+            state_tx.emit(TrayState { items, menus })
+        }
+    }
+    async fn run_menu_interaction(
+        client: system_tray::client::Client,
+        interact_rx: impl Stream<Item = Arc<TrayMenuInteract>>,
+    ) {
+        tokio::pin!(interact_rx);
+        while let Some(interact) = interact_rx.next().await {
+            let TrayMenuInteract {
+                addr,
+                menu_path,
+                id,
+            } = &*interact;
+
+            if let Err(err) = client
+                .activate(system_tray::client::ActivateRequest::MenuItem {
+                    address: str::to_owned(addr),
+                    menu_path: str::to_owned(menu_path),
+                    submenu_id: *id,
+                })
+                .await
+            {
+                log::error!("Failed to send ActivateRequest: {err}");
+            }
+        }
+        log::warn!("Tray interact stream was closed");
+    }
+}
+
+impl Module for TrayModule {
+    async fn run_module_instance(
+        self: Arc<Self>,
         ModuleArgs {
-            mut act_tx,
-            upd_rx,
-            reload_rx,
+            act_tx,
+            mut upd_rx,
+            mut reload_rx,
             ..
         }: ModuleArgs,
         _cancel: crate::utils::CancelDropGuard,
     ) {
-        let (tx, rx) = connect(reload_rx);
+        let handle = self.enter_backend().await;
+        let TrayBackend {
+            state_rx,
+            menu_interact_tx: mut interact_tx,
+            mut reload_tx,
+        } = handle.backend().clone();
 
-        enum Upd {
-            Tray(TrayState),
-            Module(ModuleUpd),
-        }
-        let rx = rx.map(Upd::Tray).merge(upd_rx.map(Upd::Module));
-        let mut cur_menus = Default::default();
-        let mut cur_items = Default::default();
-        tokio::pin!(rx);
-        while let Some(upd) = rx.next().await {
-            match upd {
-                Upd::Tray(TrayState { items, menus }) => {
-                    cur_menus = menus;
-                    cur_items = items;
+        let reload_fut = reload_tx.reload_on(&mut reload_rx);
 
-                    let mut parts = Vec::new();
-                    for (addr, item) in cur_items.iter() {
-                        for system_tray::item::IconPixmap {
-                            width,
-                            height,
-                            pixels,
-                        } in item.icon_pixmap.as_deref().unwrap_or(&[])
-                        {
-                            let mut img = match image::RgbaImage::from_vec(
-                                width.cast_unsigned(),
-                                height.cast_unsigned(),
-                                pixels.clone(),
-                            ) {
-                                Some(img) => img,
-                                None => {
-                                    log::error!("Failed to load image from bytes");
-                                    continue;
-                                }
-                            };
-
-                            // https://users.rust-lang.org/t/argb32-color-model/92061/4
-                            for image::Rgba(pixel) in img.pixels_mut() {
-                                *pixel = u32::from_be_bytes(*pixel).rotate_left(8).to_be_bytes();
-                            }
-                            let mut png_data = Vec::new();
-                            if let Err(err) =
-                                img.write_with_encoder(image::codecs::png::PngEncoder::new(
-                                    std::io::Cursor::new(&mut png_data),
-                                ))
-                            {
-                                log::error!("Error encoding image: {err}");
+        let bar_fut = async {
+            let mut act_tx = act_tx.clone();
+            let mut state_rx = state_rx.clone();
+            while state_rx.changed().await.is_ok() {
+                let items = state_rx.borrow_and_update().items.clone();
+                let mut parts = Vec::new();
+                for (addr, item) in items.iter() {
+                    for system_tray::item::IconPixmap {
+                        width,
+                        height,
+                        pixels,
+                    } in item.icon_pixmap.as_deref().unwrap_or(&[])
+                    {
+                        let mut img = match image::RgbaImage::from_vec(
+                            width.cast_unsigned(),
+                            height.cast_unsigned(),
+                            pixels.clone(),
+                        ) {
+                            Some(img) => img,
+                            None => {
+                                log::error!("Failed to load image from bytes");
                                 continue;
                             }
+                        };
 
-                            parts.extend([
-                                tui::StackItem::auto(tui::InteractElem::new(
-                                    Arc::new(Tag { addr: addr.clone() }),
-                                    tui::Image::load_or_empty(png_data, image::ImageFormat::Png),
-                                )),
-                                tui::StackItem::spacing(1),
-                            ])
+                        // https://users.rust-lang.org/t/argb32-color-model/92061/4
+                        for image::Rgba(pixel) in img.pixels_mut() {
+                            *pixel = u32::from_be_bytes(*pixel).rotate_left(8).to_be_bytes();
                         }
+                        let mut png_data = Vec::new();
+                        if let Err(err) =
+                            img.write_with_encoder(image::codecs::png::PngEncoder::new(
+                                std::io::Cursor::new(&mut png_data),
+                            ))
+                        {
+                            log::error!("Error encoding image: {err}");
+                            continue;
+                        }
+
+                        parts.extend([
+                            tui::StackItem::auto(tui::InteractElem::new(
+                                Arc::new(TrayInteractTag { addr: addr.clone() }),
+                                tui::Image::load_or_empty(png_data, image::ImageFormat::Png),
+                            )),
+                            tui::StackItem::spacing(1),
+                        ])
                     }
-                    let tui = tui::Stack::horizontal(parts);
-                    act_tx.emit(ModuleAct::RenderAll(tui.into()));
                 }
-                Upd::Module(ModuleUpd::Interact(ModuleInteract {
-                    location,
-                    payload,
-                    kind,
-                })) => {
-                    if let Some(Tag { addr }) = payload.tag.downcast_ref() {
+                let tui = tui::Stack::horizontal(parts);
+                act_tx.emit(ModuleAct::RenderAll(tui.into()));
+            }
+        };
+
+        let interact_fut = async {
+            let mut act_tx = act_tx.clone();
+            while let Some(upd) = upd_rx.next().await {
+                match upd {
+                    ModuleUpd::Interact(ModuleInteract {
+                        location,
+                        payload: ModuleInteractPayload { tag, monitor },
+                        kind,
+                    }) => {
+                        if let Ok(menu_interact) = Arc::downcast(tag.clone()) {
+                            interact_tx.emit(menu_interact);
+                            continue;
+                        }
+                        let Some(TrayInteractTag { addr }) = tag.downcast_ref() else {
+                            continue;
+                        };
+
                         let menu_kind;
                         let tui;
                         match kind {
                             tui::InteractKind::Hover => {
+                                let items = state_rx.borrow().items.clone();
                                 let Some(system_tray::item::Tooltip {
                                     icon_name: _,
                                     icon_data: _,
                                     title,
                                     description,
-                                }) = cur_items
-                                    .iter()
-                                    .find(|(a, _)| a == addr)
-                                    .and_then(|(_, item)| item.tool_tip.as_ref())
+                                }) = items.get(addr).and_then(|item| item.tool_tip.as_ref())
                                 else {
                                     log::error!("Unknown tray addr {addr}");
                                     continue;
@@ -276,11 +345,12 @@ impl Module for Tray {
                                 .into();
                             }
                             tui::InteractKind::Click(tui::MouseButton::Right) => {
+                                let menus = state_rx.borrow().menus.clone();
                                 let Some(TrayMenuExt {
                                     menu_path,
                                     submenus,
                                     ..
-                                }) = cur_menus.iter().find(|(a, _)| a == addr).map(|(_, it)| it)
+                                }) = menus.get(addr)
                                 else {
                                     log::error!("Unknown tray addr {addr}");
                                     continue;
@@ -306,7 +376,7 @@ impl Module for Tray {
                             _ => continue,
                         };
                         act_tx.emit(ModuleAct::OpenMenu(OpenMenu {
-                            monitor: payload.monitor,
+                            monitor,
                             tui,
                             pos: location,
                             menu_kind,
@@ -314,7 +384,9 @@ impl Module for Tray {
                     }
                 }
             }
-        }
+        };
+
+        await_first!(reload_fut, bar_fut, interact_fut);
     }
 }
 fn tray_menu_item_to_tui(

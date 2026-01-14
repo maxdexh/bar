@@ -2,7 +2,7 @@ use anyhow::{Context as _, anyhow, bail};
 use futures::Stream;
 use libpulse_binding::{
     self as pulse, context::introspect::ServerInfo, mainloop::standard::IterateResult,
-    volume::Volume,
+    time::MicroSeconds, volume::Volume,
 };
 
 use pulse::{
@@ -16,6 +16,7 @@ use pulse::{
 };
 use tokio::task::JoinSet;
 use tokio_stream::StreamExt as _;
+use tokio_util::sync::CancellationToken;
 
 use std::{
     cell::RefCell,
@@ -26,20 +27,24 @@ use std::{
 use crate::{
     modules::prelude::*,
     tui,
-    utils::{Emit, ReloadRx, ResultExt, SharedEmit, unb_chan},
+    utils::{CancelDropGuard, Emit, ReloadRx, ResultExt, SharedEmit, unb_chan},
 };
 
 pub fn connect(
     reload_rx: ReloadRx,
 ) -> (impl SharedEmit<PulseUpdate>, impl Stream<Item = PulseState>) {
     let (ev_tx, ev_rx) = unb_chan();
-    std::thread::spawn(|| match run_blocking(ev_tx, reload_rx) {
+
+    let cancel = CancellationToken::new();
+    let cancel_pulse_arg = CancelDropGuard::from(cancel.clone());
+    std::thread::spawn(|| match run_blocking(ev_tx, reload_rx, cancel_pulse_arg) {
         Ok(()) => log::warn!("PulseAudio client has quit"),
         Err(err) => log::error!("PulseAudio client has failed: {err}"),
     });
     let (up_tx, up_rx) = unb_chan();
 
     tokio::task::spawn(async move {
+        let _cancel = CancelDropGuard::from(cancel);
         match run_updater(up_rx).await {
             Ok(()) => log::warn!("PulseAudio updater has quit"),
             Err(err) => log::error!("PulseAudio updater has failed: {err}"),
@@ -88,7 +93,11 @@ fn handle_iterate_result(res: IterateResult) -> anyhow::Result<()> {
     }
 }
 
-fn run_blocking(tx: impl SharedEmit<PulseState>, mut reload_rx: ReloadRx) -> anyhow::Result<()> {
+fn run_blocking(
+    tx: impl SharedEmit<PulseState>,
+    mut reload_rx: ReloadRx,
+    cancel: CancelDropGuard,
+) -> anyhow::Result<()> {
     log::info!("Connecting to PulseAudio");
 
     let awaiting_reload = Arc::new(AtomicBool::new(false));
@@ -242,14 +251,23 @@ fn run_blocking(tx: impl SharedEmit<PulseState>, mut reload_rx: ReloadRx) -> any
     });
 
     loop {
-        handle_iterate_result(mainloop.iterate(true))?;
+        mainloop.prepare(MicroSeconds::from_millis(500))?;
+        mainloop.poll()?;
+        mainloop.dispatch()?;
+
         if awaiting_reload.swap(false, std::sync::atomic::Ordering::Relaxed) {
             context
                 .borrow()
                 .introspect()
                 .get_server_info(full_update.clone());
         }
+
+        if cancel.inner.is_cancelled() {
+            break;
+        }
     }
+
+    Ok(())
 }
 
 fn avg_volume_frac(vol: &ChannelVolumes) -> f64 {
@@ -274,7 +292,9 @@ async fn run_updater(updates: impl Stream<Item = PulseUpdate>) -> anyhow::Result
             it.stderr(std::process::Stdio::piped());
             it
         };
+        // FIXME: Can we do this with libpulse_binding instead?
         let output = match kind {
+            // FIXME: Task pooling/buffer_unordered
             PulseUpdateKind::VolumeDelta(vol_delta) => {
                 pactl()
                     .args([set_vol_cmd, device_name, &format!("{vol_delta:+}%")])
@@ -309,10 +329,10 @@ async fn run_updater(updates: impl Stream<Item = PulseUpdate>) -> anyhow::Result
 }
 
 // FIXME: Refactor
-pub struct Pulse;
-impl Module for Pulse {
-    async fn run_instance(
-        &self,
+pub struct PulseModule;
+impl Module for PulseModule {
+    async fn run_module_instance(
+        self: Arc<Self>,
         ModuleArgs {
             mut act_tx,
             mut upd_rx,

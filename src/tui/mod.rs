@@ -6,7 +6,7 @@ pub trait InteractPayload: std::any::Any + std::fmt::Debug + Send + Sync {}
 impl<T> InteractPayload for T where T: std::any::Any + std::fmt::Debug + Send + Sync {}
 impl dyn InteractPayload {
     pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> {
-        (self as &dyn std::any::Any).downcast_ref()
+        <dyn std::any::Any>::downcast_ref(self)
     }
 }
 
@@ -46,6 +46,11 @@ impl From<InteractElem> for Elem {
 impl From<Text> for Elem {
     fn from(value: Text) -> Self {
         Self::Text(value)
+    }
+}
+impl From<Arc<Elem>> for Elem {
+    fn from(value: Arc<Elem>) -> Self {
+        Self::Shared(value)
     }
 }
 

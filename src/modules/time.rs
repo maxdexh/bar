@@ -1,5 +1,5 @@
 use super::prelude::*;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use chrono::Timelike;
 use futures::Stream;
@@ -47,10 +47,10 @@ async fn run(mut tx: impl Emit<String>) {
     }
 }
 
-pub struct Time;
-impl Module for Time {
-    async fn run_instance(
-        &self,
+pub struct TimeModule;
+impl Module for TimeModule {
+    async fn run_module_instance(
+        self: Arc<Self>,
         ModuleArgs {
             mut act_tx,
             mut reload_rx,

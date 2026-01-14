@@ -45,7 +45,6 @@ pub fn spawn_generic_panel<AK: AsRef<OsStr>, AV: AsRef<OsStr>>(
     let tmpdir = tempfile::TempDir::new()?;
     let sock_path = tmpdir.path().join("term-updates.sock");
     let socket = tokio::net::UnixListener::bind(&sock_path)?;
-    log::debug!("{}", sock_path.display());
     let mut child = tokio::process::Command::new("kitten")
         .arg("panel")
         .args(extra_args)
@@ -151,7 +150,6 @@ async fn term_proc_main_inner() -> anyhow::Result<()> {
     let (mut ev_tx, upd_rx);
     {
         let socket = std::env::var_os(SOCK_PATH_VAR).context("Missing socket path env var")?;
-        log::debug!("{}", socket.display());
         let socket = tokio::net::UnixStream::connect(socket)
             .await
             .context("Failed to connect to socket")?;

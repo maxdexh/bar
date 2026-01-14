@@ -1,5 +1,3 @@
-#![allow(clippy::collapsible_if)]
-
 mod data;
 mod logging;
 mod modules;

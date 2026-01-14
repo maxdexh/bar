@@ -5,5 +5,7 @@ pkgs.mkShell {
   buildInputs = [
     pkgs.rustPlatform.bindgenHook
     pkgs.libpulseaudio
+    pkgs.pulseaudio
+    pkgs.wlr-randr
   ];
 }

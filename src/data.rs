@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct WorkspaceId(Arc<str>);
 impl From<&str> for WorkspaceId {
     fn from(value: &str) -> Self {
@@ -15,7 +13,7 @@ impl From<String> for WorkspaceId {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct BasicWorkspace {
     pub id: WorkspaceId,
     pub name: Arc<str>,
@@ -23,7 +21,7 @@ pub struct BasicWorkspace {
     pub is_active: bool,
 }
 
-#[derive(Clone, Default, Debug, Serialize, Deserialize)]
+#[derive(Clone, Default, Debug)]
 pub struct BasicDesktopState {
     pub workspaces: Vec<BasicWorkspace>,
 }

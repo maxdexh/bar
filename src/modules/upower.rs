@@ -305,10 +305,10 @@ mod udbus {
 // FIXME: refactor
 use crate::modules::prelude::*;
 #[derive(Debug)]
-pub struct Energy;
-impl Module for Energy {
-    async fn run_instance(
-        &self,
+pub struct EnergyModule;
+impl Module for EnergyModule {
+    async fn run_module_instance(
+        self: Arc<Self>,
         ModuleArgs {
             mut act_tx,
             upd_rx: _upd_rx,
@@ -336,7 +336,7 @@ impl Module for Energy {
 
             let tui = tui::Stack::horizontal([
                 tui::StackItem::auto(tui::InteractElem::new(
-                    Arc::new(Energy),
+                    Arc::new(EnergyModule),
                     tui::Text::plain(energy),
                 )),
                 tui::StackItem::spacing(3),

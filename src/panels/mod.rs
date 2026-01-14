@@ -72,7 +72,7 @@ fn mod_inst(
     let (upd_tx, upd_rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
 
-    let tui = old.map_or(BarTuiElem::Shared(tui::Elem::Empty), |it| it.tui);
+    let tui = old.map_or_else(|| BarTuiElem::Shared(Default::default()), |it| it.tui);
     (
         ModuleInst {
             _cancel: cancel.clone().into(),
@@ -97,8 +97,8 @@ enum Upd {
 
 #[derive(Debug, Clone)]
 enum BarTuiElem {
-    Shared(tui::Elem),
-    ByMonitor(HashMap<Arc<str>, tui::Elem>),
+    Shared(Arc<tui::Elem>),
+    ByMonitor(HashMap<Arc<str>, Arc<tui::Elem>>),
     Hide,
 }
 #[derive(Default)]
@@ -191,6 +191,9 @@ pub async fn run_manager(bar_upd_rx: impl Stream<Item = BarMgrUpd> + Send + 'sta
                 reload_tx.reload();
             }
             Upd::Monitor(ev) => {
+                for monitor in ev.removed() {
+                    state.monitors.remove(monitor);
+                }
                 for monitor in ev.added_or_changed() {
                     let cancel = CancellationToken::new();
                     let (menu_tx, menu_rx) = unb_chan();
@@ -222,11 +225,12 @@ pub async fn run_manager(bar_upd_rx: impl Stream<Item = BarMgrUpd> + Send + 'sta
                     let mut rerender = false;
                     match act {
                         ModuleAct::RenderByMonitor(elems) => {
+                            let elems = elems.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
                             module.tui = BarTuiElem::ByMonitor(elems);
                             rerender = true
                         }
                         ModuleAct::RenderAll(elem) => {
-                            module.tui = BarTuiElem::Shared(tui::Elem::Shared(Arc::new(elem)));
+                            module.tui = BarTuiElem::Shared(Arc::new(elem));
                             rerender = true
                         }
                         ModuleAct::OpenMenu(open) => {
