@@ -1,37 +1,62 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
-use futures::Stream;
-use serde::{Deserialize, Serialize};
-use tokio_stream::StreamExt;
 use tokio_util::task::AbortOnDropHandle;
 pub use udbus::*;
 
 use crate::tui;
-use crate::utils::{
-    Emit, ReloadRx, ReloadTx, ResultExt, WatchRx, WatchTx, stream_from_fn, watch_chan,
-};
+use crate::utils::{Emit, ReloadRx, ReloadTx, ResultExt, WatchRx, WatchTx, watch_chan};
 
-// https://upower.freedesktop.org/docs/UPower.html
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct EnergyState {
-    pub bstate: BatteryState,
-    pub rate: f64,
-    pub percentage: f64,
-    // corresponds to IsPresent for display device, see docs
-    pub should_show: bool,
-}
-impl Default for EnergyState {
-    fn default() -> Self {
-        Self {
-            bstate: BatteryState::Unknown,
-            rate: 0.0,
-            percentage: 100.0,
-            should_show: false,
+macro_rules! declare_properties {
+    (
+        [$((
+            $field_name:ident,
+            $prop_name:expr,
+            $typ:ty,
+            $($default:expr)?,
+        )),* $(,)? ]
+    ) => {
+        pub struct EnergyState {
+            $($field_name: $typ,)*
+            _p: (),
         }
-    }
+
+        impl EnergyState {
+            fn update(&mut self, prop_name: &str, value: zbus::zvariant::OwnedValue) -> anyhow::Result<bool> {
+                match prop_name {
+                    $($prop_name => {
+                        let value = value.try_into()?;
+                        if self.$field_name == value {
+                            return Ok(false);
+                        }
+                        self.$field_name = value;
+                        Ok(true)
+                    })*
+                    _ => Ok(false),
+                }
+            }
+        }
+
+        impl Default for EnergyState {
+            fn default() -> Self {
+                Self {
+                    $($field_name: '__default: {
+                        $( break '__default $default; )?
+                        Default::default()
+                    },)*
+                    _p: (),
+                }
+            }
+        }
+    };
 }
+declare_properties!([
+    (battery_level, "BatteryLevel", BatteryLevel,,),
+    (battery_state, "BatteryState", BatteryState,,),
+    (is_present, "IsPresent", bool,,),
+    (percentage, "Percentage", f64,,),
+    (energy_rate, "EnergyRate", f64,,),
+]);
 
 mod udbus {
     /// Originally taken from `upower-dbus` crate
@@ -78,9 +103,10 @@ mod udbus {
         }
     }
 
-    #[derive(Debug, Copy, Clone, OwnedValue)]
+    #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, OwnedValue, Serialize, Deserialize)]
     #[repr(u32)]
     pub enum BatteryType {
+        #[default]
         Unknown = 0,
         LinePower = 1,
         Battery = 2,
@@ -92,9 +118,10 @@ mod udbus {
         Phone = 8,
     }
 
-    #[derive(Debug, Copy, Clone, OwnedValue)]
+    #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, OwnedValue, Serialize, Deserialize)]
     #[repr(u32)]
     pub enum BatteryLevel {
+        #[default]
         Unknown = 0,
         None = 1,
         Low = 3,
@@ -202,9 +229,6 @@ mod udbus {
         #[zbus(object = "Device")]
         fn get_display_device(&self);
 
-        #[zbus(name = "GetDisplayDevice")]
-        fn get_display_device_(&self) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
-
         /// DeviceAdded signal
         #[zbus(signal)]
         fn device_added(&self, device: zbus::zvariant::ObjectPath<'_>) -> zbus::Result<()>;
@@ -240,76 +264,73 @@ pub struct EnergyModule {
 
 impl EnergyModule {
     async fn run_bg(state_tx: WatchTx<EnergyState>, mut reload_rx: ReloadRx) {
-        let device = loop {
-            let Some(it) = async {
-                let dbus = zbus::Connection::system().await?;
-                let upower = UPowerProxy::<'static>::new(&dbus).await?;
-                let device = upower.get_display_device().await?;
-                anyhow::Ok(device)
-            }
-            .await
-            .ok_or_log() else {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                continue;
+        let mut run_fallible = async || {
+            let dbus = zbus::Connection::system().await.ok_or_log()?;
+            let upower = UPowerProxy::<'static>::new(&dbus).await.ok_or_log()?;
+
+            let device = upower.get_display_device().await.ok_or_log()?;
+            let device_proxy = device.inner();
+            let properties = zbus::fdo::PropertiesProxy::builder(&dbus)
+                .destination(device_proxy.destination())
+                .ok_or_log()?
+                .path(device_proxy.path())
+                .ok_or_log()?
+                .build()
+                .await
+                .ok_or_log()?;
+
+            let prop_change_rx = device_proxy.receive_all_signals().await.ok_or_log()?;
+            let main_fut =
+                futures::StreamExt::for_each_concurrent(prop_change_rx, 10, async |msg| {
+                    let header = msg.header();
+                    let Some(member) = header.member() else {
+                        return;
+                    };
+
+                    let Some(value) = properties
+                        .get(device_proxy.interface().clone(), member)
+                        .await
+                        .ok_or_log()
+                    else {
+                        return;
+                    };
+
+                    state_tx.send_if_modified(|state| {
+                        state.update(member, value).ok_or_log().unwrap_or(false)
+                    });
+                });
+            let reload_fut = async {
+                while let Some(()) = reload_rx.wait().await {
+                    let Some(props) = properties
+                        .get_all(device_proxy.interface().clone())
+                        .await
+                        .ok_or_log()
+                    else {
+                        continue;
+                    };
+                    state_tx.send_modify(|state| {
+                        for (member, value) in props {
+                            state.update(&member, value).ok_or_log();
+                        }
+                    });
+                    device.refresh().await.ok_or_log();
+                }
             };
 
-            break it;
+            tokio::select! {
+                () = main_fut => (),
+                () = reload_fut => (),
+            }
+
+            Some(())
         };
 
-        enum Upd {
-            Reload(()),
-            Rate(f64),
-            Percentage(f64),
-            ShouldShow(bool),
-            BState(BatteryState),
-        }
+        loop {
+            if let Some(()) = run_fallible().await {
+                break;
+            };
 
-        fn stream_prop<'a, T: TryFrom<zbus::zvariant::OwnedValue, Error: Into<zbus::Error>>>(
-            prop: impl Stream<Item = zbus::proxy::PropertyChanged<'a, T>>,
-            tf: impl Fn(T) -> Upd,
-            propname: &str,
-        ) -> impl Stream<Item = Upd> {
-            prop.then(|opt| async move { opt.get().await })
-                .filter_map(move |it| {
-                    it.with_context(|| format!("Failed to get {propname}"))
-                        .ok_or_log()
-                })
-                .map(tf)
-        }
-
-        // TODO: Use Proxy::receive_property_changed?
-        let updates = stream_from_fn(async move || reload_rx.wait().await)
-            .map(Upd::Reload)
-            .merge(stream_prop(
-                device.receive_energy_rate_changed().await,
-                Upd::Rate,
-                "wattage",
-            ))
-            .merge(stream_prop(
-                device.receive_percentage_changed().await,
-                Upd::Percentage,
-                "percentage",
-            ))
-            .merge(stream_prop(
-                device.receive_is_present_changed().await,
-                Upd::ShouldShow,
-                "isPresent attribute",
-            ))
-            .merge(stream_prop(
-                device.receive_state_changed().await,
-                Upd::BState,
-                "charge state",
-            ));
-        tokio::pin!(updates);
-
-        while let Some(update) = updates.next().await {
-            state_tx.send_modify(|state| match update {
-                Upd::Reload(()) => (),
-                Upd::Rate(rate) => state.rate = rate,
-                Upd::Percentage(percentage) => state.percentage = percentage,
-                Upd::ShouldShow(should_show) => state.should_show = should_show,
-                Upd::BState(bstate) => state.bstate = bstate,
-            })
+            tokio::time::sleep(Duration::from_secs(60)).await;
         }
     }
 }
@@ -346,18 +367,18 @@ impl Module for EnergyModule {
         let render_fut = async {
             while let Ok(()) = state_rx.changed().await {
                 let energy = state_rx.borrow_and_update();
-                if !energy.should_show {
+                if !energy.is_present {
                     act_tx.emit(ModuleAct::HideModule);
                     continue;
                 }
 
                 // TODO: Time estimate tooltip
                 let percentage = energy.percentage.round() as i64;
-                let sign = match energy.bstate {
+                let sign = match energy.battery_state {
                     BatteryState::Discharging | BatteryState::PendingDischarge => '-',
                     _ => '+',
                 };
-                let rate = format!("{sign}{:.1}W", energy.rate);
+                let rate = format!("{sign}{:.1}W", energy.energy_rate);
                 let energy = format!("{percentage:>3}% {rate:>6}");
 
                 act_tx.emit(ModuleAct::RenderAll(tui::StackItem::auto(

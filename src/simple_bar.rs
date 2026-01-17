@@ -9,12 +9,13 @@ use crate::{
         self,
         prelude::{Module, ModuleArgs},
     },
-    panels::{BarMgrModuleArgs, BarMgrModuleStartArgs, BarMgrUpd},
+    panels::{self, BarMgrModuleArgs, BarMgrModuleStartArgs, BarMgrUpd},
     tui,
     utils::{Emit, ResultExt, unb_chan},
 };
 
-fn mkstart<M: Module>(module: Arc<M>, cfg: M::Config) -> BarMgrModuleStartArgs {
+fn mkstart<M: Module>(module: Arc<M>, cfg: impl Into<M::Config>) -> BarMgrModuleStartArgs {
+    let cfg = cfg.into();
     let start = move |args| {
         let BarMgrModuleArgs {
             inst_id,
@@ -81,27 +82,26 @@ struct Modules {
     fixed: WeakModule<modules::fixed::FixedTuiModule>,
 }
 
-#[expect(clippy::unit_arg)]
 pub async fn main() {
     let mut tasks = JoinSet::new();
     let mut bar_upd_tx;
     {
         let bar_upd_rx;
         (bar_upd_tx, bar_upd_rx) = unb_chan();
-        tasks.spawn(crate::panels::run_manager(bar_upd_rx));
+        tasks.spawn(panels::run_manager(bar_upd_rx));
     }
 
     let mut ms = Modules::default();
 
-    bar_upd_tx.emit(BarMgrUpd::LoadModules(crate::panels::LoadModules {
+    bar_upd_tx.emit(BarMgrUpd::LoadModules(panels::LoadModules {
         modules: [
             mkstart(ms.fixed.get(), tui::StackItem::spacing(1)),
-            mkstart(ms.hypr.get(), Default::default()),
+            mkstart(ms.hypr.get(), ()),
             mkstart(
                 ms.fixed.get(),
                 tui::StackItem::new(tui::Constr::Fill(1), tui::Elem::Empty),
             ),
-            mkstart(ms.tray.get(), Default::default()),
+            mkstart(ms.tray.get(), ()),
             mkstart(ms.fixed.get(), tui::StackItem::spacing(3)),
             mkstart(
                 ms.pulse.get(),
@@ -135,9 +135,9 @@ pub async fn main() {
                     ..Default::default()
                 },
             ),
-            mkstart(ms.energy.get(), Default::default()),
+            mkstart(ms.energy.get(), ()),
             mkstart(ms.fixed.get(), tui::StackItem::spacing(3)),
-            mkstart(ms.time.get(), Default::default()),
+            mkstart(ms.time.get(), ()),
             mkstart(ms.fixed.get(), tui::StackItem::spacing(1)),
         ]
         .into(),
