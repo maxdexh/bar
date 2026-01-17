@@ -107,7 +107,8 @@ mod udbus {
     #[proxy(
         interface = "org.freedesktop.UPower.Device",
         default_service = "org.freedesktop.UPower",
-        assume_defaults = false
+        assume_defaults = false,
+        gen_blocking = false
     )]
     pub trait Device {
         #[zbus(property)]
@@ -185,7 +186,11 @@ mod udbus {
         fn voltage(&self) -> zbus::Result<f64>;
     }
 
-    #[proxy(interface = "org.freedesktop.UPower", assume_defaults = true)]
+    #[proxy(
+        interface = "org.freedesktop.UPower",
+        assume_defaults = true,
+        gen_blocking = false
+    )]
     pub trait UPower {
         /// EnumerateDevices method
         fn enumerate_devices(&self) -> zbus::Result<Vec<zbus::zvariant::OwnedObjectPath>>;
@@ -196,6 +201,9 @@ mod udbus {
         /// GetDisplayDevice method
         #[zbus(object = "Device")]
         fn get_display_device(&self);
+
+        #[zbus(name = "GetDisplayDevice")]
+        fn get_display_device_(&self) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
 
         /// DeviceAdded signal
         #[zbus(signal)]
@@ -233,18 +241,19 @@ pub struct EnergyModule {
 impl EnergyModule {
     async fn run_bg(state_tx: WatchTx<EnergyState>, mut reload_rx: ReloadRx) {
         let device = loop {
-            let fut = async {
+            let Some(it) = async {
                 let dbus = zbus::Connection::system().await?;
-                let device_proxy = UPowerProxy::<'static>::new(&dbus).await?;
-                let device = device_proxy.get_display_device().await?;
+                let upower = UPowerProxy::<'static>::new(&dbus).await?;
+                let device = upower.get_display_device().await?;
                 anyhow::Ok(device)
-            };
-            let Some(trip) = fut.await.ok_or_log() else {
+            }
+            .await
+            .ok_or_log() else {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 continue;
             };
 
-            break trip;
+            break it;
         };
 
         enum Upd {

@@ -1,3 +1,9 @@
+mod render;
+pub use render::*;
+mod layout;
+pub use layout::*;
+
+use anyhow::Context;
 use std::sync::Arc;
 
 // FIXME: Split mod by elem kind
@@ -149,18 +155,15 @@ pub struct Image {
     pub img: image::RgbaImage,
 }
 impl Image {
-    pub fn load_or_empty(data: impl AsRef<[u8]>, format: image::ImageFormat) -> Elem {
+    pub fn try_load(data: impl AsRef<[u8]>, format: image::ImageFormat) -> anyhow::Result<Image> {
         image::load_from_memory_with_format(data.as_ref(), format)
             .context("Systray icon has invalid png data")
-            .ok_or_log()
-            .map_or(Elem::Empty, |img| {
-                Image {
-                    img: img.into_rgba8(),
-                }
-                .into()
+            .map(|img| Image {
+                img: img.into_rgba8(),
             })
     }
 }
+
 impl std::fmt::Debug for Image {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut hasher = std::hash::DefaultHasher::new();
@@ -380,10 +383,3 @@ impl LineSet {
         }
     }
 }
-mod render;
-use anyhow::Context;
-pub use render::*;
-mod layout;
-pub use layout::*;
-
-use crate::utils::ResultExt as _;

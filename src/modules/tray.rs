@@ -276,8 +276,10 @@ impl Module for TrayModule {
                                         addr: addr.clone(),
                                     }),
                                 },
-                                elem: tui::Image::load_or_empty(png_data, image::ImageFormat::Png)
-                                    .into(),
+                                elem: tui::Image::try_load(png_data, image::ImageFormat::Png)
+                                    .ok_or_log()
+                                    .map(Into::into)
+                                    .unwrap_or_default(),
                             }),
                             tui::StackItem::spacing(1),
                         ])
@@ -299,7 +301,7 @@ impl Module for TrayModule {
                         kind,
                     }) => {
                         if let Some(menu_interact) = tag.downcast_ref() {
-                            interact_tx.emit(Clone::clone(&menu_interact));
+                            interact_tx.emit(Clone::clone(menu_interact));
                             continue;
                         }
                         let Some(TrayInteractTag { addr }) = tag.downcast_ref() else {
@@ -443,10 +445,12 @@ fn tray_menu_item_to_tui(
                         tui::StackItem::length(
                             1,
                             tui::Stack::horizontal([
-                                tui::StackItem::auto(tui::Image::load_or_empty(
-                                    icon,
-                                    image::ImageFormat::Png,
-                                )),
+                                tui::StackItem::auto(
+                                    tui::Image::try_load(icon, image::ImageFormat::Png)
+                                        .ok_or_log()
+                                        .map(tui::Elem::from)
+                                        .unwrap_or_default(),
+                                ),
                                 tui::StackItem::spacing(1),
                                 tui::StackItem::auto(tui::Text::plain(first_line)),
                             ]),
