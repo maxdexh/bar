@@ -5,30 +5,7 @@ pub use layout::*;
 
 use std::{fmt, sync::Arc};
 
-trait InteractTagBounds: std::any::Any + fmt::Debug + Send + Sync {}
-impl<T> InteractTagBounds for T where T: std::any::Any + fmt::Debug + Send + Sync {}
-
-#[derive(Debug, Clone)]
-pub struct InteractTag {
-    inner: Arc<dyn InteractTagBounds>,
-}
-impl InteractTag {
-    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> {
-        log::trace!(
-            "T={:?}, D={:?}",
-            std::any::TypeId::of::<T>(),
-            self.inner.type_id(),
-        );
-        // WARN: Arc<dyn InteractTagBounds> implements InteractTagBounds too,
-        // so make sure this is actually a deref!
-        <dyn std::any::Any>::downcast_ref(&*self.inner as &dyn std::any::Any)
-    }
-    pub fn new(inner: impl std::any::Any + fmt::Debug + Send + Sync) -> Self {
-        Self {
-            inner: Arc::new(inner),
-        }
-    }
-}
+use crate::utils::SharedEmit;
 
 #[derive(Default, Debug, Clone)]
 enum ElemKind {
@@ -36,7 +13,6 @@ enum ElemKind {
     Image(Image),
     Stack(Stack),
     Block(Box<Block>),
-    Interact(Box<InteractElem>),
     Shared(Arc<Elem>),
     #[default]
     Empty,
@@ -45,18 +21,34 @@ enum ElemKind {
 #[derive(Default, Debug, Clone)]
 pub struct Elem {
     kind: ElemKind,
+    on_interact: Option<InteractCallback>,
 }
 impl Elem {
     pub fn empty() -> Self {
         Self {
             kind: ElemKind::Empty,
+            ..Default::default()
         }
+    }
+
+    pub fn on_interact_fn(self, callback: impl Fn(InteractData) + 'static + Send + Sync) -> Self {
+        self.on_interact(InteractCallback::from_fn(callback))
+    }
+
+    pub fn on_interact_emit(self, callback: impl SharedEmit<InteractData>) -> Self {
+        self.on_interact(InteractCallback::from_emit(callback))
+    }
+
+    pub fn on_interact(mut self, callback: InteractCallback) -> Self {
+        self.on_interact = Some(callback);
+        self
     }
 }
 impl From<Stack> for Elem {
     fn from(value: Stack) -> Self {
         Self {
             kind: ElemKind::Stack(value),
+            ..Default::default()
         }
     }
 }
@@ -64,6 +56,7 @@ impl From<Image> for Elem {
     fn from(value: Image) -> Self {
         Self {
             kind: ElemKind::Image(value),
+            ..Default::default()
         }
     }
 }
@@ -71,13 +64,7 @@ impl From<Block> for Elem {
     fn from(value: Block) -> Self {
         Self {
             kind: ElemKind::Block(Box::new(value)),
-        }
-    }
-}
-impl From<InteractElem> for Elem {
-    fn from(value: InteractElem) -> Self {
-        Self {
-            kind: ElemKind::Interact(Box::new(value)),
+            ..Default::default()
         }
     }
 }
@@ -85,6 +72,7 @@ impl From<Arc<Elem>> for Elem {
     fn from(value: Arc<Elem>) -> Self {
         Self {
             kind: ElemKind::Shared(value),
+            ..Default::default()
         }
     }
 }
@@ -92,6 +80,7 @@ impl<D: Into<String>> From<RawPrint<D>> for Elem {
     fn from(value: RawPrint<D>) -> Self {
         Self {
             kind: ElemKind::Print(value.map(Into::into)),
+            ..Default::default()
         }
     }
 }
@@ -180,12 +169,30 @@ impl<'a> PlainLines<'a> {
     }
 }
 
-// FIXME: InteractTag should uniquely identify a module instance.
-// E.g. store sender/on_interact here directly?
-#[derive(Debug, Clone)]
-pub struct InteractElem {
-    pub payload: InteractPayload,
-    pub elem: Elem,
+#[derive(Clone)]
+pub struct InteractCallback(Arc<dyn SharedEmit<InteractData>>);
+impl fmt::Debug for InteractCallback {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&std::any::Any::type_id(&self.0), f)
+    }
+}
+impl InteractCallback {
+    pub fn from_fn(callback: impl Fn(InteractData) + 'static + Send + Sync) -> Self {
+        Self::from_emit(move |it| {
+            callback(it);
+            Ok(())
+        })
+    }
+    pub fn from_emit(emit: impl SharedEmit<InteractData>) -> Self {
+        Self(Arc::new(emit))
+    }
+}
+
+pub struct InteractData {
+    pub location: Vec2<u32>,
+    pub monitor: Arc<str>,
+    pub kind: InteractKind,
+    _p: (),
 }
 
 #[derive(Clone, Copy, Debug)]

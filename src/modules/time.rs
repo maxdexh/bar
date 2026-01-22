@@ -22,7 +22,7 @@ impl Module for TimeModule {
         self: Arc<Self>,
         cfg: Self::Config,
         ModuleArgs {
-            mut act_tx,
+            act_tx,
             mut reload_rx,
             ..
         }: ModuleArgs,

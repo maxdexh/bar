@@ -13,7 +13,7 @@ impl Module for FixedTuiModule {
         self: std::sync::Arc<Self>,
         cfg: Self::Config,
         ModuleArgs {
-            mut act_tx,
+            act_tx,
             mut reload_rx,
             ..
         }: ModuleArgs,

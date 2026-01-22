@@ -146,7 +146,7 @@ pub async fn term_proc_main() {
 
 async fn term_proc_main_inner() -> anyhow::Result<()> {
     let mut tasks = JoinSet::new();
-    let (mut ev_tx, upd_rx);
+    let (ev_tx, upd_rx);
     {
         let socket = std::env::var_os(SOCK_PATH_VAR).context("Missing socket path env var")?;
         let socket = tokio::net::UnixStream::connect(socket)
@@ -269,7 +269,7 @@ async fn term_proc_main_inner() -> anyhow::Result<()> {
 
 async fn read_cobs_sock<T: serde::de::DeserializeOwned>(
     read: tokio::net::unix::OwnedReadHalf,
-    mut tx: impl SharedEmit<T>,
+    tx: impl SharedEmit<T>,
 ) {
     use tokio::io::AsyncBufReadExt as _;
     let mut read = tokio::io::BufReader::new(read);

@@ -78,6 +78,7 @@ fn run_blocking(
     cancel: CancellationToken,
     awaiting_reload: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
+    let tx = Rc::new(tx);
     log::info!("Connecting to PulseAudio");
 
     let mut mainloop = Mainloop::new().ok_or_else(|| anyhow!("Failed to create mainloop"))?;
@@ -114,7 +115,7 @@ fn run_blocking(
     fn update_and_send(
         kind: PulseDeviceKind,
         state: Rc<RefCell<PulseState>>,
-        mut tx: impl SharedEmit<PulseState>,
+        tx: Rc<impl SharedEmit<PulseState>>,
         context: &RefCell<Context>,
     ) {
         let name = {
@@ -129,7 +130,7 @@ fn run_blocking(
             return;
         };
 
-        let mut doit = move |volume: &ChannelVolumes, muted: bool| {
+        let doit = move |volume: &ChannelVolumes, muted: bool| {
             tx.emit({
                 let mut state = state.borrow_mut();
                 let dstate = match kind {
@@ -365,10 +366,8 @@ impl Module for PulseModule {
             unmuted_sym,
         }: Self::Config,
         ModuleArgs {
-            mut act_tx,
-            mut upd_rx,
+            act_tx,
             mut reload_rx,
-            inst_id,
             ..
         }: ModuleArgs,
         _cancel: crate::utils::CancelDropGuard,
@@ -386,65 +385,50 @@ impl Module for PulseModule {
                     PulseDeviceKind::Sink => &pulse.sink,
                     PulseDeviceKind::Source => &pulse.source,
                 };
+                //payload: tui::InteractPayload {
+                //    mod_inst: inst_id.clone(),
+                //    tag: tui::InteractTag::new(device_kind),
+                //},
                 act_tx.emit(ModuleAct::RenderAll(tui::StackItem::auto(
-                    tui::InteractElem {
-                        payload: tui::InteractPayload {
-                            mod_inst: inst_id.clone(),
-                            tag: tui::InteractTag::new(device_kind),
-                        },
-                        elem: tui::Stack::horizontal([
-                            tui::StackItem::auto(if muted {
-                                muted_sym.clone()
-                            } else {
-                                unmuted_sym.clone()
-                            }),
-                            tui::StackItem::auto(tui::RawPrint::plain(format!(
-                                "{:>3}%",
-                                (volume * 100.0).round() as u32
-                            ))),
-                        ])
-                        .into(),
-                    },
+                    tui::Elem::from(tui::Stack::horizontal([
+                        tui::StackItem::auto(if muted {
+                            muted_sym.clone()
+                        } else {
+                            unmuted_sym.clone()
+                        }),
+                        tui::StackItem::auto(tui::RawPrint::plain(format!(
+                            "{:>3}%",
+                            (volume * 100.0).round() as u32
+                        ))),
+                    ]))
+                    .on_interact_fn({
+                        let update_tx = self.update_tx.clone();
+                        move |interact| {
+                            update_tx.emit(PulseUpdate {
+                                target: device_kind,
+                                kind: match interact.kind {
+                                    tui::InteractKind::Click(tui::MouseButton::Left) => {
+                                        PulseUpdateKind::ToggleMute
+                                    }
+                                    tui::InteractKind::Click(tui::MouseButton::Right) => {
+                                        PulseUpdateKind::ResetVolume
+                                    }
+                                    tui::InteractKind::Scroll(direction) => {
+                                        PulseUpdateKind::VolumeDelta(
+                                            2 * match direction {
+                                                tui::Direction::Up => 1,
+                                                tui::Direction::Down => -1,
+                                                tui::Direction::Left => -1,
+                                                tui::Direction::Right => 1,
+                                            },
+                                        )
+                                    }
+                                    _ => return,
+                                },
+                            })
+                        }
+                    }),
                 )));
-            }
-        });
-
-        let mut update_tx = self.update_tx.clone();
-        tasks.spawn(async move {
-            while let Some(upd) = upd_rx.next().await {
-                match upd {
-                    ModuleUpd::Interact(ModuleInteract {
-                        location: _,
-                        payload,
-                        kind,
-                    }) => {
-                        let Some(&target) = payload.tag.downcast_ref::<PulseDeviceKind>() else {
-                            continue;
-                        };
-                        update_tx.emit(PulseUpdate {
-                            target,
-                            kind: match kind {
-                                tui::InteractKind::Click(tui::MouseButton::Left) => {
-                                    PulseUpdateKind::ToggleMute
-                                }
-                                tui::InteractKind::Click(tui::MouseButton::Right) => {
-                                    PulseUpdateKind::ResetVolume
-                                }
-                                tui::InteractKind::Scroll(direction) => {
-                                    PulseUpdateKind::VolumeDelta(
-                                        2 * match direction {
-                                            tui::Direction::Up => 1,
-                                            tui::Direction::Down => -1,
-                                            tui::Direction::Left => -1,
-                                            tui::Direction::Right => 1,
-                                        },
-                                    )
-                                }
-                                _ => continue,
-                            },
-                        });
-                    }
-                }
             }
         });
 

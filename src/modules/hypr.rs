@@ -20,7 +20,7 @@ pub struct HyprModule {
 }
 
 impl HyprModule {
-    async fn run_bg(mut basic_tx: impl SharedEmit<BasicDesktopState>, mut reload_rx: ReloadRx) {
+    async fn run_bg(basic_tx: impl SharedEmit<BasicDesktopState>, mut reload_rx: ReloadRx) {
         let ev_rx = hyprland::event_listener::EventStream::new()
             .filter_map(|res| res.context("Hyprland error").ok_or_log());
         tokio::pin!(ev_rx);
@@ -134,10 +134,8 @@ impl Module for HyprModule {
         self: Arc<Self>,
         cfg: Self::Config,
         ModuleArgs {
-            mut act_tx,
-            mut upd_rx,
+            act_tx,
             mut reload_rx,
-            inst_id,
             ..
         }: ModuleArgs,
         _cancel: crate::utils::CancelDropGuard,
@@ -145,65 +143,41 @@ impl Module for HyprModule {
         let mut basic_rx = self.basic_rx.clone();
         let mut reload_tx = self.reload_tx.clone();
 
-        enum Upd {
-            State,
-            Update(ModuleUpd),
-        }
         loop {
-            let upd = tokio::select! {
+            tokio::select! {
                 res = basic_rx.changed() => match res {
-                    Ok(()) => Upd::State,
+                    Ok(()) => {},
                     Err(_) => break,
                 },
                 Some(()) = reload_rx.wait() => {
                     reload_tx.reload();
                     continue;
                 }
-                Some(upd) = upd_rx.next() => Upd::Update(upd),
             };
-            match upd {
-                Upd::State => {
-                    let mut by_monitor = HashMap::new();
-                    {
-                        let state = basic_rx.borrow_and_update();
-                        for ws in state.workspaces.iter() {
-                            let Some(monitor) = ws.monitor.clone() else {
-                                continue;
-                            };
-                            let wss = by_monitor.entry(monitor).or_insert_with(Vec::new);
-                            wss.push(tui::StackItem::auto(tui::InteractElem {
-                                elem: tui::RawPrint::plain(&ws.name)
-                                    .styled(tui::Style {
-                                        fg: ws.is_active.then_some(tui::Color::Green),
-                                        ..Default::default()
-                                    })
-                                    .into(),
-                                payload: tui::InteractPayload {
-                                    mod_inst: inst_id.clone(),
-                                    tag: tui::InteractTag::new(ws.id.clone()),
-                                },
-                            }));
-                            wss.push(tui::StackItem::spacing(1));
-                        }
-                    }
-                    let by_monitor = by_monitor
-                        .into_iter()
-                        .map(|(k, v)| (k, tui::StackItem::auto(tui::Stack::horizontal(v))))
-                        .collect();
-
-                    act_tx.emit(ModuleAct::RenderByMonitor(by_monitor));
-                }
-                Upd::Update(upd) => match upd {
-                    ModuleUpd::Interact(ModuleInteract {
-                        payload: ModuleInteractPayload { tag, .. },
-                        kind: tui::InteractKind::Click(tui::MouseButton::Left),
-                        ..
-                    }) => {
-                        // TODO: Switch ws
-                    }
-                    ModuleUpd::Interact(_) => {}
-                },
+            let mut by_monitor = HashMap::new();
+            for ws in basic_rx.borrow_and_update().workspaces.iter() {
+                let Some(monitor) = ws.monitor.clone() else {
+                    continue;
+                };
+                let wss = by_monitor.entry(monitor).or_insert_with(Vec::new);
+                wss.push(tui::StackItem::auto(
+                    tui::Elem::from(tui::RawPrint::plain(&ws.name).styled(tui::Style {
+                        fg: ws.is_active.then_some(tui::Color::Green),
+                        ..Default::default()
+                    }))
+                    .on_interact_fn(|interact| {
+                        // TODO: Switch ws on lclick
+                        // TODO: Show workspace info on rclick/hover
+                    }),
+                ));
+                wss.push(tui::StackItem::spacing(1));
             }
+            let by_monitor = by_monitor
+                .into_iter()
+                .map(|(k, v)| (k, tui::StackItem::auto(tui::Stack::horizontal(v))))
+                .collect();
+
+            act_tx.emit(ModuleAct::RenderByMonitor(by_monitor));
         }
     }
 }

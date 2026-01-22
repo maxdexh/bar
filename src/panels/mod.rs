@@ -11,14 +11,12 @@ use tokio_stream::StreamExt;
 use tokio_util::{sync::CancellationToken, time::FutureExt as _};
 
 use crate::{
-    modules::prelude::{
-        MenuKind, ModuleAct, ModuleInteract, ModuleInteractPayload, ModuleUpd, OpenMenu,
-    },
+    modules::prelude::{MenuKind, ModuleAct, OpenMenu},
     monitors::{MonitorEvent, MonitorInfo},
     tui,
     utils::{
-        CancelDropGuard, Emit, EmitResult, ReloadRx, ReloadTx, ResultExt, SharedEmit, UnbRx, UnbTx,
-        WatchRx, WatchTx, unb_chan,
+        CancelDropGuard, Emit, EmitResult, ReloadRx, ReloadTx, ResultExt, UnbRx, UnbTx, WatchRx,
+        WatchTx, unb_chan,
     },
 };
 
@@ -33,20 +31,18 @@ pub struct ModuleActTxImpl {
     tx: UnbTx<Upd>,
 }
 impl Emit<ModuleAct> for ModuleActTxImpl {
-    fn try_emit(&mut self, val: ModuleAct) -> EmitResult<ModuleAct> {
+    fn try_emit(&self, val: ModuleAct) -> EmitResult<ModuleAct> {
         self.tx
             .try_emit(Upd::Act(self.id.clone(), val))
             .map_err(|err| err.retype())
     }
 }
-pub type ModuleUpdRxImpl = tokio_stream::wrappers::UnboundedReceiverStream<ModuleUpd>;
 
 pub enum BarMgrUpd {
     LoadModules(LoadModules),
 }
 pub struct BarMgrModuleArgs {
     pub act_tx: ModuleActTxImpl,
-    pub upd_rx: ModuleUpdRxImpl,
     pub reload_rx: crate::utils::ReloadRx,
     pub cancel: tokio_util::sync::CancellationToken,
     pub inst_id: ModInstIdImpl,
@@ -62,26 +58,22 @@ pub struct LoadModules {
 struct ModuleInst {
     _cancel: CancelDropGuard,
     tui: BarTuiElem,
-    upd_tx: UnbTx<ModuleUpd>,
 }
 fn mod_inst(
     inst_id: ModInstIdImpl,
     reload_rx: ReloadRx,
     act_tx: ModuleActTxImpl,
 ) -> (ModuleInst, BarMgrModuleArgs) {
-    let (upd_tx, upd_rx) = tokio::sync::mpsc::unbounded_channel();
     let cancel = CancellationToken::new();
 
     (
         ModuleInst {
             _cancel: cancel.clone().into(),
             tui: BarTuiElem::Hide,
-            upd_tx,
         },
         BarMgrModuleArgs {
             cancel,
             act_tx,
-            upd_rx: upd_rx.into(),
             reload_rx,
             inst_id,
         },
@@ -92,7 +84,6 @@ enum Upd {
     Bar(BarMgrUpd),
     Monitor(MonitorEvent),
     Act(ModInstIdImpl, ModuleAct),
-    Mod(ModInstIdImpl, ModuleUpd),
 }
 
 #[derive(Debug, Clone)]
@@ -152,13 +143,6 @@ pub async fn run_manager(bar_upd_rx: impl Stream<Item = BarMgrUpd> + Send + 'sta
             Some(upd) = mgr_upd_rx.next() => upd,
         };
         match upd {
-            Upd::Mod(id, ev) => {
-                if let Some(module) = state.modules.get_mut(&id) {
-                    module.upd_tx.emit(ev);
-                } else {
-                    log::error!("Unknown module id {id:?}");
-                }
-            }
             Upd::Bar(BarMgrUpd::LoadModules(LoadModules { modules })) => {
                 for m in modules {
                     let id = next_mod_id();
@@ -191,7 +175,6 @@ pub async fn run_manager(bar_upd_rx: impl Stream<Item = BarMgrUpd> + Send + 'sta
                         bar_tui_tx.subscribe(),
                         menu_rx,
                         reload_tx.clone(),
-                        mgr_upd_tx.clone().with(|(id, ev)| Upd::Mod(id, ev)),
                     ));
                     state.monitors.insert(
                         monitor.name.clone(),
@@ -257,7 +240,6 @@ async fn run_monitor(
     mut bar_tui_rx: WatchRx<Vec<BarTuiElem>>,
     menu_rx: impl Stream<Item = OpenMenu>,
     mut reload_tx: ReloadTx,
-    mut mod_upd_tx: impl SharedEmit<(ModInstIdImpl, ModuleUpd)>,
 ) {
     tokio::pin!(menu_rx);
 
@@ -353,7 +335,7 @@ async fn run_monitor(
                 .await
             },
             async {
-                let mut menu = init_term(
+                let menu = init_term(
                     format!("MENU@{}", monitor.name),
                     vec![
                         {
@@ -374,7 +356,7 @@ async fn run_monitor(
                         "-o=background=black".into(),
                         "-o=foreground=white".into(),
                         // Center within leftover pixels if cell size does not divide window size.
-                        "-o=placement-strategy=center".into(),
+                        "-o=placement_strategy=center".into(),
                         // location of the menu
                         "--edge=top".into(),
                         // disable hiding the mouse
@@ -429,7 +411,7 @@ async fn run_monitor(
         .await??;
 
         subtasks.spawn({
-            let mut upd_tx = intern_upd_tx.clone();
+            let upd_tx = intern_upd_tx.clone();
             async move {
                 use tokio::io::AsyncReadExt as _;
                 loop {
@@ -500,29 +482,15 @@ async fn run_monitor(
                 Upd::Term(term_kind, ev) => match ev {
                     TermEvent::Crossterm(ev) => match ev {
                         crossterm::event::Event::Mouse(ev) => {
-                            match bar.layout.interpret_mouse_event(ev, bar.sizes.font_size()) {
-                                Some(tui::TuiInteract {
-                                    location,
-                                    payload: Some(tui::InteractPayload { mod_inst, tag }),
-                                    kind,
-                                }) => {
-                                    mod_upd_tx.emit((
-                                        mod_inst,
-                                        ModuleUpd::Interact(ModuleInteract {
-                                            location,
-                                            payload: ModuleInteractPayload {
-                                                tag,
-                                                monitor: monitor.name.clone(),
-                                            },
-                                            kind: kind.clone(),
-                                        }),
-                                    ));
-                                }
-                                Some(tui::TuiInteract {
-                                    location: _,
-                                    payload: None,
-                                    kind,
-                                }) if matches!(term_kind, TermKind::Bar) => {
+                            if let Some((_, kind, callback)) = bar.layout.interpret_mouse_event(
+                                ev,
+                                bar.sizes.font_size(),
+                                monitor.name.clone(),
+                            ) {
+                                if let Some(callback) = callback {
+                                    // FIXME: Run callbacks on dedicated thread.
+                                    callback();
+                                } else if matches!(term_kind, TermKind::Bar) {
                                     let hide = match kind {
                                         tui::InteractKind::Hover => {
                                             show_menu.as_ref().is_some_and(|it| match it.kind {
@@ -538,7 +506,6 @@ async fn run_monitor(
                                         resize_menu = true;
                                     }
                                 }
-                                _ => (),
                             }
                         }
                         _ => {

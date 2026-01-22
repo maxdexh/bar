@@ -20,7 +20,6 @@ fn mkstart<M: Module>(module: Arc<M>, cfg: impl Into<M::Config>) -> BarMgrModule
         let BarMgrModuleArgs {
             inst_id,
             act_tx,
-            upd_rx,
             reload_rx,
             cancel,
         } = args;
@@ -32,16 +31,7 @@ fn mkstart<M: Module>(module: Arc<M>, cfg: impl Into<M::Config>) -> BarMgrModule
 
         tokio::spawn(async move {
             module
-                .run_module_instance(
-                    cfg,
-                    ModuleArgs {
-                        inst_id,
-                        act_tx,
-                        upd_rx,
-                        reload_rx,
-                    },
-                    cancel.clone().into(),
-                )
+                .run_module_instance(cfg, ModuleArgs { act_tx, reload_rx }, cancel.clone().into())
                 .with_cancellation_token_owned(cancel)
                 .await
         });
@@ -84,7 +74,7 @@ struct Modules {
 
 pub async fn main() {
     let mut tasks = JoinSet::new();
-    let mut bar_upd_tx;
+    let bar_upd_tx;
     {
         let bar_upd_rx;
         (bar_upd_tx, bar_upd_rx) = unb_chan();

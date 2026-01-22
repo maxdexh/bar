@@ -7,7 +7,7 @@ use tokio_util::task::AbortOnDropHandle;
 pub use udbus::*;
 
 use crate::tui;
-use crate::utils::{Emit, ReloadRx, ReloadTx, ResultExt, WatchRx, WatchTx, watch_chan};
+use crate::utils::{Emit, ReloadRx, ReloadTx, ResultExt, WatchRx, WatchTx, unb_chan, watch_chan};
 
 macro_rules! declare_properties {
     (
@@ -412,8 +412,6 @@ impl Module for EnergyModule {
         ModuleArgs {
             act_tx,
             mut reload_rx,
-            mut upd_rx,
-            inst_id,
             ..
         }: ModuleArgs,
         _cancel: crate::utils::CancelDropGuard,
@@ -421,8 +419,12 @@ impl Module for EnergyModule {
         let state_rx = self.state_rx.clone();
         let mut reload_tx = self.reload_tx.clone();
 
+        let (interact_tx, mut interact_rx) = unb_chan();
+
+        let on_interact =
+            tui::InteractCallback::from_fn(move |interact| interact_tx.emit(interact));
+
         let render_fut = async {
-            let mut act_tx = act_tx.clone();
             let mut state_rx = state_rx.clone();
             while let Ok(()) = state_rx.changed().await {
                 let energy = state_rx.borrow_and_update();
@@ -441,59 +443,50 @@ impl Module for EnergyModule {
                 let rate = format!("{sign}{:.1}W", energy.energy_rate);
                 let energy = format!("{percentage:>3}% {rate:<6}");
 
+                //payload: tui::InteractPayload {
+                //    mod_inst: inst_id.clone(),
+                //    tag: tui::InteractTag::new(EnergyInteractTag),
+                //},
                 act_tx.emit(ModuleAct::RenderAll(tui::StackItem::auto(
-                    tui::InteractElem {
-                        payload: tui::InteractPayload {
-                            mod_inst: inst_id.clone(),
-                            tag: tui::InteractTag::new(EnergyInteractTag),
-                        },
-                        elem: tui::RawPrint::plain(energy).into(),
-                    },
+                    tui::Elem::from(tui::RawPrint::plain(energy)).on_interact(on_interact.clone()),
                 )));
             }
         };
         let menu_fut = async {
-            let mut act_tx = act_tx.clone();
-            while let Some(upd) = upd_rx.next().await {
-                match upd {
-                    ModuleUpd::Interact(ModuleInteract {
-                        location,
-                        payload: ModuleInteractPayload { tag, monitor },
-                        kind,
-                    }) => {
-                        let Some(EnergyInteractTag {}) = tag.downcast_ref() else {
-                            continue;
-                        };
-
-                        let text = {
-                            let lock = state_rx.borrow();
-                            let display_time = |time: Duration| {
-                                let hours = time.as_secs() / 3600;
-                                let mins = (time.as_secs() / 60) % 60;
-                                format!("{hours}h {mins}min")
-                            };
-                            match lock.battery_state {
-                                BatteryState::Discharging | BatteryState::PendingDischarge => {
-                                    format!("Battery empty in {}", display_time(lock.time_to_empty))
-                                }
-                                BatteryState::FullyCharged => "Battery full".to_owned(),
-                                BatteryState::Empty => "Battery empty".to_owned(),
-                                BatteryState::Unknown => "Battery state unknown".to_owned(),
-                                BatteryState::Charging | BatteryState::PendingCharge => {
-                                    format!("Battery full in {}", display_time(lock.time_to_full))
-                                }
-                            }
-                        };
-
-                        if let tui::InteractKind::Hover = kind {
-                            act_tx.emit(ModuleAct::OpenMenu(OpenMenu {
-                                monitor,
-                                tui: tui::RawPrint::plain(text).into(),
-                                location,
-                                menu_kind: MenuKind::Tooltip,
-                            }))
+            while let Some(tui::InteractData {
+                location,
+                monitor,
+                kind,
+                ..
+            }) = interact_rx.next().await
+            {
+                let text = {
+                    let lock = state_rx.borrow();
+                    let display_time = |time: Duration| {
+                        let hours = time.as_secs() / 3600;
+                        let mins = (time.as_secs() / 60) % 60;
+                        format!("{hours}h {mins}min")
+                    };
+                    match lock.battery_state {
+                        BatteryState::Discharging | BatteryState::PendingDischarge => {
+                            format!("Battery empty in {}", display_time(lock.time_to_empty))
+                        }
+                        BatteryState::FullyCharged => "Battery full".to_owned(),
+                        BatteryState::Empty => "Battery empty".to_owned(),
+                        BatteryState::Unknown => "Battery state unknown".to_owned(),
+                        BatteryState::Charging | BatteryState::PendingCharge => {
+                            format!("Battery full in {}", display_time(lock.time_to_full))
                         }
                     }
+                };
+
+                if let tui::InteractKind::Hover = kind {
+                    act_tx.emit(ModuleAct::OpenMenu(OpenMenu {
+                        monitor,
+                        tui: tui::RawPrint::plain(text).into(),
+                        location,
+                        menu_kind: MenuKind::Tooltip,
+                    }))
                 }
             }
         };
@@ -505,6 +498,3 @@ impl Module for EnergyModule {
         }
     }
 }
-
-#[derive(Debug)]
-struct EnergyInteractTag;

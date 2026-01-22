@@ -24,10 +24,10 @@ pub type EmitResult<T> = Result<(), EmitError<T>>;
 
 pub trait Emit<T> {
     #[track_caller]
-    fn try_emit(&mut self, val: T) -> EmitResult<T>;
+    fn try_emit(&self, val: T) -> EmitResult<T>;
 
     #[track_caller]
-    fn emit(&mut self, val: T) {
+    fn emit(&self, val: T) {
         if let Err(err) = self.try_emit(val) {
             log::warn!("{err}");
         }
@@ -40,46 +40,36 @@ pub trait Emit<T> {
         EmitWith(self, f, PhantomData)
     }
 }
-impl<T, F: FnMut(T) -> EmitResult<T>> Emit<T> for F {
-    fn try_emit(&mut self, val: T) -> EmitResult<T> {
+impl<T, F: Fn(T) -> EmitResult<T>> Emit<T> for F {
+    fn try_emit(&self, val: T) -> EmitResult<T> {
         self(val)
     }
 }
 impl<T> Emit<T> for UnbTx<T> {
-    fn try_emit(&mut self, val: T) -> EmitResult<T> {
-        self.send(val).map_err(|_| EmitError(PhantomData))
-    }
-}
-impl<T> Emit<T> for &UnbTx<T> {
-    fn try_emit(&mut self, val: T) -> EmitResult<T> {
+    fn try_emit(&self, val: T) -> EmitResult<T> {
         self.send(val).map_err(|_| EmitError(PhantomData))
     }
 }
 impl<T> Emit<T> for std::sync::mpsc::Sender<T> {
-    fn try_emit(&mut self, val: T) -> EmitResult<T> {
-        self.send(val).map_err(|_| EmitError(PhantomData))
-    }
-}
-impl<T> Emit<T> for &WatchTx<T> {
-    fn try_emit(&mut self, val: T) -> EmitResult<T> {
+    fn try_emit(&self, val: T) -> EmitResult<T> {
         self.send(val).map_err(|_| EmitError(PhantomData))
     }
 }
 impl<T> Emit<T> for WatchTx<T> {
-    fn try_emit(&mut self, val: T) -> EmitResult<T> {
+    fn try_emit(&self, val: T) -> EmitResult<T> {
         self.send(val).map_err(|_| EmitError(PhantomData))
     }
 }
-pub trait SharedEmit<T>: Emit<T> + Clone + 'static + Send + Sync {}
-impl<S: Emit<T> + Clone + 'static + Send + Sync, T> SharedEmit<T> for S {}
+pub trait SharedEmit<T>: Emit<T> + 'static + Send + Sync {}
+impl<S: Emit<T> + 'static + Send + Sync, T> SharedEmit<T> for S {}
 
 pub struct EmitWith<E, F, U>(E, F, PhantomData<fn(U)>);
 impl<E, F, T, U> Emit<U> for EmitWith<E, F, U>
 where
     E: Emit<T>,
-    F: FnMut(U) -> T,
+    F: Fn(U) -> T,
 {
-    fn try_emit(&mut self, val: U) -> EmitResult<U> {
+    fn try_emit(&self, val: U) -> EmitResult<U> {
         self.0
             .try_emit(self.1(val))
             .map_err(|_| EmitError(PhantomData))

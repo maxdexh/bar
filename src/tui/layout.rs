@@ -67,10 +67,10 @@ impl Axis {
 
 #[derive(Debug, Default)]
 pub struct RenderedLayout {
-    widgets: Vec<(Area, InteractPayload)>,
+    widgets: Vec<(Area, InteractCallback)>,
 }
 impl RenderedLayout {
-    pub fn insert(&mut self, rect: Area, widget: InteractPayload) {
+    pub fn insert(&mut self, rect: Area, widget: InteractCallback) {
         self.widgets.push((rect, widget));
     }
 
@@ -78,7 +78,8 @@ impl RenderedLayout {
         &mut self,
         event: crossterm::event::MouseEvent,
         font_size: Vec2<u16>,
-    ) -> Option<TuiInteract> {
+        monitor: Arc<str>,
+    ) -> Option<(Vec2<u32>, InteractKind, Option<impl FnOnce()>)> {
         use crossterm::event::*;
 
         let MouseEvent {
@@ -89,7 +90,7 @@ impl RenderedLayout {
         } = event;
         let pos = Vec2 { x: column, y: row };
 
-        let (area, tag) = self
+        let (area, cb) = self
             .widgets
             .iter()
             .find(|(r, _)| r.contains(pos))
@@ -121,32 +122,30 @@ impl RenderedLayout {
             }
         };
 
-        Some(TuiInteract {
-            location: {
-                let font_w = u32::from(font_size.x);
-                let font_h = u32::from(font_size.y);
-                Vec2 {
-                    x: u32::from(area.pos.x) * font_w + u32::from(area.size.x) * font_w / 2,
-                    y: u32::from(area.pos.y) * font_h + u32::from(area.size.y) * font_h / 2,
-                }
-            },
-            payload: tag.cloned(),
-            kind,
-        })
-    }
-}
-pub type TuiInteract = InteractGeneric<Option<InteractPayload>>;
-#[derive(Debug, Clone)]
-pub struct InteractPayload {
-    pub mod_inst: crate::modules::prelude::ModInstId,
-    pub tag: InteractTag,
-}
+        let location = {
+            let font_w = u32::from(font_size.x);
+            let font_h = u32::from(font_size.y);
+            Vec2 {
+                x: u32::from(area.pos.x) * font_w + u32::from(area.size.x) * font_w / 2,
+                y: u32::from(area.pos.y) * font_h + u32::from(area.size.y) * font_h / 2,
+            }
+        };
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct InteractGeneric<T> {
-    pub location: Vec2<u32>,
-    pub payload: T,
-    pub kind: InteractKind,
+        Some((
+            location,
+            kind.clone(),
+            cb.cloned().map(move |cb| {
+                move || {
+                    cb.0.emit(InteractData {
+                        location,
+                        monitor,
+                        kind,
+                        _p: (),
+                    })
+                }
+            }),
+        ))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

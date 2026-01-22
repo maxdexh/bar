@@ -48,6 +48,9 @@ impl Tui {
 }
 impl Render for Elem {
     fn render(&self, ctx: &mut RenderCtx<impl Write>, area: Area) -> std::io::Result<()> {
+        if let Some(callback) = self.on_interact.clone() {
+            ctx.layout.insert(area, callback);
+        }
         self.kind.render(ctx, area)
     }
     fn calc_min_size(&self, args: &SizingArgs) -> Vec2<u16> {
@@ -64,10 +67,6 @@ impl Render for ElemKind {
             Self::Stack(subdiv) => subdiv.render(ctx, area),
             Self::Image(image) => image.render(ctx, area),
             Self::Block(block) => block.render(ctx, area),
-            Self::Interact(elem) => {
-                ctx.layout.insert(area, elem.payload.clone());
-                elem.elem.render(ctx, area)
-            }
             Self::Shared(elem) => elem.render(ctx, area),
             Self::Empty => Ok(()),
             Self::Print(raw_print) => {
@@ -80,7 +79,6 @@ impl Render for ElemKind {
             Self::Stack(subdiv) => subdiv.calc_min_size(args),
             Self::Image(image) => image.calc_min_size(args),
             Self::Block(block) => block.calc_min_size(args),
-            Self::Interact(elem) => elem.elem.calc_min_size(args),
             Self::Shared(elem) => elem.calc_min_size(args),
             Self::Empty => Vec2::default(),
             Self::Print(raw_print) => raw_print.size,

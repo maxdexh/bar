@@ -22,6 +22,91 @@ pub struct TrayMenuInteract {
     pub menu_path: Arc<str>,
     pub id: i32,
 }
+//match interact.kind {
+//    tui::InteractKind::Hover => {
+//        let items = state_rx.borrow().items.clone();
+
+//        // FIXME: Handle more attrs
+//        let Some(system_tray::item::Tooltip {
+//            icon_name: _,
+//            icon_data: _,
+//            title,
+//            description,
+//        }) = items
+//            .get(addr)
+//            .and_then(|item| item.tool_tip.as_ref())
+//        else {
+//            log::error!("Unknown tray addr {addr}");
+//            return;
+//        };
+
+//        let tui = tui::Stack::vertical([
+//            tui::StackItem::auto(tui::Stack::horizontal([
+//                tui::StackItem::new(
+//                    tui::Constr::Fill(1),
+//                    tui::Elem::empty(),
+//                ),
+//                tui::StackItem::auto(
+//                    tui::PlainLines::new(title.as_str())
+//                        .styled(tui::Style {
+//                            modifier: tui::Modifier {
+//                                bold: true,
+//                                ..Default::default()
+//                            },
+//                            ..Default::default()
+//                        }),
+//                ),
+//                tui::StackItem::new(
+//                    tui::Constr::Fill(1),
+//                    tui::Elem::empty(),
+//                ),
+//            ])),
+//            tui::StackItem::auto(tui::PlainLines::new(
+//                description.as_str(),
+//            )),
+//        ]);
+//        act_tx.emit(ModuleAct::OpenMenu(OpenMenu {
+//            monitor: interact.monitor,
+//            tui: tui.into(),
+//            location: interact.location,
+//            menu_kind: MenuKind::Tooltip,
+//        }));
+//    }
+//    tui::InteractKind::Click(tui::MouseButton::Right) => {
+//        let menus = self.state_rx.borrow().menus.clone();
+//        let Some(TrayMenuExt {
+//            menu_path,
+//            submenus,
+//            ..
+//        }) = menus.get(addr)
+//        else {
+//            log::error!("Unknown tray addr {addr}");
+//            return;
+//        };
+
+//        let tui = tui::Block {
+//            borders: tui::Borders::all(),
+//            border_style: tui::Style {
+//                fg: Some(tui::Color::DarkGrey),
+//                ..Default::default()
+//            },
+//            border_set: tui::LineSet::thick(),
+//            inner: Some(tray_menu_to_tui(
+//                0,
+//                submenus,
+//                addr,
+//                menu_path.as_ref(),
+//            )),
+//        };
+//        act_tx.emit(ModuleAct::OpenMenu(OpenMenu {
+//            monitor: interact.monitor,
+//            tui: tui.into(),
+//            location: interact.location,
+//            menu_kind: MenuKind::Context,
+//        }));
+//    }
+//    _ => (),
+//};
 
 #[derive(Debug, Default)]
 pub struct TrayState {
@@ -34,11 +119,6 @@ pub struct TrayMenuExt {
     pub id: u32,
     pub menu_path: Option<Arc<str>>,
     pub submenus: Vec<system_tray::menu::MenuItem>,
-}
-
-#[derive(Debug)]
-struct TrayInteractTag {
-    addr: Arc<str>,
 }
 
 pub struct TrayModule {
@@ -70,7 +150,7 @@ impl TrayModule {
         let mut tasks = JoinSet::<()>::new();
 
         {
-            let (mut tx, rx) = unb_chan();
+            let (tx, rx) = unb_chan();
 
             // Minimize lagged events
             let event_rx = lossy_broadcast(client.subscribe());
@@ -97,7 +177,7 @@ impl TrayModule {
     async fn run_state_fetcher(
         state_mutex: Arc<std::sync::Mutex<system_tray::data::BaseMap>>,
         client_rx: impl Stream<Item = system_tray::client::Event>,
-        mut state_tx: impl SharedEmit<TrayState>,
+        state_tx: impl SharedEmit<TrayState>,
         mut reload_rx: ReloadRx,
     ) {
         let fetch_blocking = move || {
@@ -219,18 +299,16 @@ impl Module for TrayModule {
         cfg: Self::Config,
         ModuleArgs {
             act_tx,
-            mut upd_rx,
             mut reload_rx,
-            inst_id,
             ..
         }: ModuleArgs,
         _cancel: crate::utils::CancelDropGuard,
     ) {
         let mut reload_tx = self.reload_tx.clone();
         let reload_fut = reload_tx.reload_on(&mut reload_rx);
+        let (bar_interact_tx, mut bar_interact_rx) = unb_chan();
 
         let bar_fut = async {
-            let mut act_tx = act_tx.clone();
             let mut state_rx = self.state_rx.clone();
             while state_rx.changed().await.is_ok() {
                 let items = state_rx.borrow_and_update().items.clone();
@@ -261,20 +339,24 @@ impl Module for TrayModule {
                             *pixel = u32::from_be_bytes(*pixel).rotate_left(8).to_be_bytes();
                         }
 
+                        //payload: tui::InteractPayload {
+                        //    mod_inst: inst_id.clone(),
+                        //    tag: tui::InteractTag::new(TrayInteractTag {
+                        //        addr: addr.clone(),
+                        //    }),
+                        //},
                         parts.extend([
-                            tui::StackItem::auto(tui::InteractElem {
-                                payload: tui::InteractPayload {
-                                    mod_inst: inst_id.clone(),
-                                    tag: tui::InteractTag::new(TrayInteractTag {
-                                        addr: addr.clone(),
-                                    }),
-                                },
-                                elem: tui::Image {
+                            tui::StackItem::auto(
+                                tui::Elem::from(tui::Image {
                                     img,
                                     sizing: tui::ImageSizeMode::FillAxis(tui::Axis::Y, 1),
-                                }
-                                .into(),
-                            }),
+                                })
+                                .on_interact_fn({
+                                    let addr = addr.clone();
+                                    let bar_interact_tx = bar_interact_tx.clone();
+                                    move |interact| bar_interact_tx.emit((addr.clone(), interact))
+                                }),
+                            ),
                             tui::StackItem::spacing(1),
                         ])
                     }
@@ -285,109 +367,111 @@ impl Module for TrayModule {
         };
 
         let interact_fut = async {
-            let mut act_tx = act_tx.clone();
-            let mut interact_tx = self.menu_interact_tx.clone();
-            while let Some(upd) = upd_rx.next().await {
-                match upd {
-                    ModuleUpd::Interact(ModuleInteract {
-                        location,
-                        payload: ModuleInteractPayload { tag, monitor },
-                        kind,
-                    }) => {
-                        if let Some(menu_interact) = tag.downcast_ref() {
-                            interact_tx.emit(Clone::clone(menu_interact));
-                            continue;
-                        }
-                        let Some(TrayInteractTag { addr }) = tag.downcast_ref() else {
+            let act_tx = act_tx.clone();
+            while let Some((
+                addr,
+                tui::InteractData {
+                    monitor,
+                    location,
+                    kind,
+                    ..
+                },
+            )) = bar_interact_rx.next().await
+            {
+                match kind {
+                    tui::InteractKind::Hover => {
+                        let items = self.state_rx.borrow().items.clone();
+
+                        // FIXME: Handle more attrs
+                        let Some(system_tray::item::Tooltip {
+                            icon_name: _,
+                            icon_data: _,
+                            title,
+                            description,
+                        }) = items.get(&addr).and_then(|item| item.tool_tip.as_ref())
+                        else {
+                            log::error!("Unknown tray addr {addr}");
                             continue;
                         };
 
-                        match kind {
-                            tui::InteractKind::Hover => {
-                                let items = self.state_rx.borrow().items.clone();
-
-                                // FIXME: Handle more attrs
-                                let Some(system_tray::item::Tooltip {
-                                    icon_name: _,
-                                    icon_data: _,
-                                    title,
-                                    description,
-                                }) = items.get(addr).and_then(|item| item.tool_tip.as_ref())
-                                else {
-                                    log::error!("Unknown tray addr {addr}");
-                                    continue;
-                                };
-
-                                let tui = tui::Stack::vertical([
-                                    tui::StackItem::auto(tui::Stack::horizontal([
-                                        tui::StackItem::new(
-                                            tui::Constr::Fill(1),
-                                            tui::Elem::empty(),
-                                        ),
-                                        tui::StackItem::auto(
-                                            tui::PlainLines::new(title.as_str()).styled(
-                                                tui::Style {
-                                                    modifier: tui::Modifier {
-                                                        bold: true,
-                                                        ..Default::default()
-                                                    },
-                                                    ..Default::default()
-                                                },
-                                            ),
-                                        ),
-                                        tui::StackItem::new(
-                                            tui::Constr::Fill(1),
-                                            tui::Elem::empty(),
-                                        ),
-                                    ])),
-                                    tui::StackItem::auto(tui::PlainLines::new(
-                                        description.as_str(),
-                                    )),
-                                ]);
-                                act_tx.emit(ModuleAct::OpenMenu(OpenMenu {
-                                    monitor,
-                                    tui: tui.into(),
-                                    location,
-                                    menu_kind: MenuKind::Tooltip,
-                                }));
-                            }
-                            tui::InteractKind::Click(tui::MouseButton::Right) => {
-                                let menus = self.state_rx.borrow().menus.clone();
-                                let Some(TrayMenuExt {
-                                    menu_path,
-                                    submenus,
-                                    ..
-                                }) = menus.get(addr)
-                                else {
-                                    log::error!("Unknown tray addr {addr}");
-                                    continue;
-                                };
-
-                                let tui = tui::Block {
-                                    borders: tui::Borders::all(),
-                                    border_style: tui::Style {
-                                        fg: Some(tui::Color::DarkGrey),
+                        let tui = tui::Stack::vertical([
+                            tui::StackItem::auto(tui::Stack::horizontal([
+                                tui::StackItem::new(tui::Constr::Fill(1), tui::Elem::empty()),
+                                tui::StackItem::auto(tui::PlainLines::new(title.as_str()).styled(
+                                    tui::Style {
+                                        modifier: tui::Modifier {
+                                            bold: true,
+                                            ..Default::default()
+                                        },
                                         ..Default::default()
                                     },
-                                    border_set: tui::LineSet::thick(),
-                                    inner: Some(tray_menu_to_tui(
-                                        &inst_id,
-                                        0,
-                                        submenus,
-                                        addr,
-                                        menu_path.as_ref(),
-                                    )),
-                                };
-                                act_tx.emit(ModuleAct::OpenMenu(OpenMenu {
-                                    monitor,
-                                    tui: tui.into(),
-                                    location,
-                                    menu_kind: MenuKind::Context,
-                                }));
-                            }
-                            _ => continue,
-                        };
+                                )),
+                                tui::StackItem::new(tui::Constr::Fill(1), tui::Elem::empty()),
+                            ])),
+                            tui::StackItem::auto(tui::PlainLines::new(description.as_str())),
+                        ]);
+                        act_tx.emit(ModuleAct::OpenMenu(OpenMenu {
+                            monitor,
+                            tui: tui.into(),
+                            location,
+                            menu_kind: MenuKind::Tooltip,
+                        }));
                     }
+                    tui::InteractKind::Click(tui::MouseButton::Right) => {
+                        let menus = self.state_rx.borrow().menus.clone();
+                        let Some(TrayMenuExt {
+                            menu_path,
+                            submenus,
+                            ..
+                        }) = menus.get(&addr)
+                        else {
+                            log::error!("Unknown tray addr {addr}");
+                            continue;
+                        };
+
+                        let tui = tui::Block {
+                            borders: tui::Borders::all(),
+                            border_style: tui::Style {
+                                fg: Some(tui::Color::DarkGrey),
+                                ..Default::default()
+                            },
+                            border_set: tui::LineSet::thick(),
+                            inner: Some(tray_menu_to_tui(
+                                0,
+                                submenus,
+                                menu_path
+                                    .as_ref()
+                                    .map(|menu_path| {
+                                        |id| {
+                                            let iact = TrayMenuInteract {
+                                                addr: addr.clone(),
+                                                menu_path: menu_path.clone(),
+                                                id,
+                                            };
+                                            let menu_interact_tx = self.menu_interact_tx.clone();
+                                            tui::InteractCallback::from_fn(move |interact| {
+                                                if matches!(
+                                                    interact.kind,
+                                                    tui::InteractKind::Click(
+                                                        tui::MouseButton::Left
+                                                    )
+                                                ) {
+                                                    menu_interact_tx.emit(iact.clone());
+                                                }
+                                            })
+                                        }
+                                    })
+                                    .as_ref(),
+                            )),
+                        };
+                        act_tx.emit(ModuleAct::OpenMenu(OpenMenu {
+                            monitor,
+                            tui: tui.into(),
+                            location,
+                            menu_kind: MenuKind::Context,
+                        }));
+                    }
+                    _ => continue,
                 }
             }
         };
@@ -400,11 +484,9 @@ impl Module for TrayModule {
     }
 }
 fn tray_menu_item_to_tui(
-    inst_id: &ModInstId,
     depth: u16,
     item: &system_tray::menu::MenuItem,
-    addr: &Arc<str>,
-    menu_path: Option<&Arc<str>>,
+    on_interact: Option<&impl Fn(i32) -> tui::InteractCallback>,
 ) -> Option<tui::Elem> {
     use system_tray::menu::*;
     let main_elem = match item {
@@ -442,7 +524,7 @@ fn tray_menu_item_to_tui(
             disposition: _, // TODO: what to do with this?
             submenu: _,
         } => {
-            let elem = tui::Stack::horizontal([
+            let elem = tui::Elem::from(tui::Stack::horizontal([
                 tui::StackItem::spacing(depth + 1),
                 if let Some(icon) = icon_data
                     && let Some(img) =
@@ -470,21 +552,18 @@ fn tray_menu_item_to_tui(
                     tui::StackItem::auto(tui::PlainLines::new(label))
                 },
                 tui::StackItem::spacing(1),
-            ])
-            .into();
-            match menu_path {
-                Some(it) => tui::InteractElem {
-                    elem,
-                    payload: tui::InteractPayload {
-                        mod_inst: inst_id.clone(),
-                        tag: tui::InteractTag::new(TrayMenuInteract {
-                            addr: addr.clone(),
-                            menu_path: it.clone(),
-                            id: *id,
-                        }),
-                    },
-                }
-                .into(),
+            ]));
+
+            //payload: tui::InteractPayload {
+            //    mod_inst: inst_id.clone(),
+            //    tag: tui::InteractTag::new(TrayMenuInteract {
+            //        addr: addr.clone(),
+            //        menu_path: it.clone(),
+            //        id: *id,
+            //    }),
+            //},
+            match on_interact {
+                Some(it) => elem.on_interact(it(*id)),
                 None => elem,
             }
         }
@@ -500,29 +579,21 @@ fn tray_menu_item_to_tui(
     } else {
         tui::Stack::vertical([
             tui::StackItem::auto(main_elem),
-            tui::StackItem::auto(tray_menu_to_tui(
-                inst_id,
-                depth + 1,
-                &item.submenu,
-                addr,
-                menu_path,
-            )),
+            tui::StackItem::auto(tray_menu_to_tui(depth + 1, &item.submenu, on_interact)),
         ])
         .into()
     })
 }
 
 fn tray_menu_to_tui(
-    inst_id: &ModInstId,
     depth: u16,
     items: &[system_tray::menu::MenuItem],
-    addr: &Arc<str>,
-    menu_path: Option<&Arc<str>>,
+    on_interact: Option<&impl Fn(i32) -> tui::InteractCallback>,
 ) -> tui::Elem {
     tui::Stack::vertical(items.iter().filter_map(|item| {
         Some(tui::StackItem {
             constr: tui::Constr::Auto,
-            elem: tray_menu_item_to_tui(inst_id, depth, item, addr, menu_path)?,
+            elem: tray_menu_item_to_tui(depth, item, on_interact)?,
         })
     }))
     .into()

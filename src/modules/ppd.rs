@@ -54,7 +54,7 @@ pub struct PpdModule {
 impl PpdModule {
     async fn run_bg(
         cycle_rx: Arc<Semaphore>,
-        mut profile_tx: impl SharedEmit<Option<Arc<str>>>,
+        profile_tx: impl SharedEmit<Option<Arc<str>>>,
         mut reload_rx: ReloadRx,
     ) {
         let Some(connection) = zbus::Connection::system().await.ok_or_log() else {
@@ -160,16 +160,13 @@ impl Module for PpdModule {
         }: Self::Config,
         ModuleArgs {
             act_tx,
-            mut upd_rx,
             mut reload_rx,
-            inst_id,
             ..
         }: ModuleArgs,
         _cancel: crate::utils::CancelDropGuard,
     ) -> () {
         let profile_ui_fut = async {
             let mut profile_rx = self.profile_rx.clone();
-            let mut act_tx = act_tx.clone();
             while profile_rx.changed().await.is_ok() {
                 let profile = profile_rx.borrow_and_update();
 
@@ -180,13 +177,34 @@ impl Module for PpdModule {
                     .cloned();
 
                 act_tx.emit(match icon {
-                    Some(elem) => ModuleAct::RenderAll(tui::StackItem::auto(tui::InteractElem {
-                        elem,
-                        payload: tui::InteractPayload {
-                            mod_inst: inst_id.clone(),
-                            tag: tui::InteractTag::new(PpdInteractTag {}),
-                        },
-                    })),
+                    Some(elem) => {
+                        ModuleAct::RenderAll(tui::StackItem::auto(elem.on_interact_fn({
+                            let act_tx = act_tx.clone();
+                            let profile_rx = self.profile_rx.clone();
+                            let cycle = self.cycle.clone();
+                            move |interact| {
+                                let profile = profile_rx.borrow().clone();
+                                if let Some(profile) = profile {
+                                    match interact.kind {
+                                        tui::InteractKind::Click(tui::MouseButton::Left) => {
+                                            cycle.add_permits(1);
+                                        }
+                                        tui::InteractKind::Hover => {
+                                            act_tx.emit(ModuleAct::OpenMenu(OpenMenu {
+                                                monitor: interact.monitor,
+                                                tui: tui::PlainLines::new(&profile).into(),
+                                                location: interact.location,
+                                                menu_kind: MenuKind::Tooltip,
+                                            }))
+                                        }
+                                        _ => (),
+                                    }
+                                } else {
+                                    act_tx.emit(ModuleAct::HideModule);
+                                }
+                            }
+                        })))
+                    }
                     None => ModuleAct::HideModule,
                 })
             }
@@ -195,46 +213,9 @@ impl Module for PpdModule {
         let mut reload_tx = self.reload_tx.clone();
         let reload_fut = reload_tx.reload_on(&mut reload_rx);
 
-        let interact_fut = async {
-            let mut act_tx = act_tx.clone();
-            while let Some(upd) = upd_rx.next().await {
-                match upd {
-                    ModuleUpd::Interact(ModuleInteract {
-                        payload: ModuleInteractPayload { tag, monitor },
-                        kind,
-                        location,
-                    }) => {
-                        let Some(&PpdInteractTag {}) = tag.downcast_ref() else {
-                            continue;
-                        };
-
-                        let profile = self.profile_rx.borrow();
-                        if let Some(profile) = &*profile {
-                            match kind {
-                                tui::InteractKind::Click(tui::MouseButton::Left) => {
-                                    self.cycle.add_permits(1);
-                                }
-                                _ => act_tx.emit(ModuleAct::OpenMenu(OpenMenu {
-                                    monitor,
-                                    tui: tui::PlainLines::new(profile).into(),
-                                    location,
-                                    menu_kind: MenuKind::Tooltip,
-                                })),
-                            }
-                        } else {
-                            act_tx.emit(ModuleAct::HideModule);
-                        }
-                    }
-                }
-            }
-        };
-
         tokio::select! {
             () = profile_ui_fut => (),
             () = reload_fut => (),
-            () = interact_fut => (),
         }
     }
 }
-#[derive(Debug)]
-struct PpdInteractTag;

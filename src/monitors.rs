@@ -104,7 +104,7 @@ impl State {
     }
 }
 
-pub fn connect(mut tx: impl SharedEmit<MonitorEvent>) {
+pub fn connect(tx: impl SharedEmit<MonitorEvent>) {
     std::thread::spawn(move || {
         let mut state = State::default();
         loop {
