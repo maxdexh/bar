@@ -1,4 +1,4 @@
-use crate::data::{BasicDesktopState, BasicWorkspace};
+use crate::data::{BasicDesktopState, BasicWorkspace, WorkspaceId};
 use crate::utils::{ReloadRx, WatchRx, watch_chan};
 use crate::utils::{ResultExt, WatchTx};
 use anyhow::Context;
@@ -14,6 +14,19 @@ use tokio_util::task::AbortOnDropHandle;
 pub struct HyprClient {
     pub basic_rx: WatchRx<BasicDesktopState>,
     _background: AbortOnDropHandle<()>,
+}
+impl HyprClient {
+    pub fn switch_workspace(&self, id: WorkspaceId) {
+        tokio::spawn(async move {
+            hyprland::dispatch::Dispatch::call_async(hyprland::dispatch::DispatchType::Workspace(
+                // HACK: workspace ids do not work correctly, so we use the name instead
+                // (see creation of BasicWorkspace)
+                hyprland::dispatch::WorkspaceIdentifierWithSpecial::Name(id.as_str()),
+            ))
+            .await
+            .ok_or_log();
+        });
+    }
 }
 
 async fn run_bg(basic_tx: WatchTx<BasicDesktopState>, mut reload_rx: ReloadRx) {
@@ -96,7 +109,9 @@ async fn run_bg(basic_tx: WatchTx<BasicDesktopState>, mut reload_rx: ReloadRx) {
                  }| {
                     let mon = monitor_id.and_then(|id| monitors.get(&id));
                     BasicWorkspace {
-                        id: id.to_string().into(),
+                        // HACK: workspace ids do not work correctly, so we use the name instead
+                        // (see switch_workspace)
+                        id: name.as_str().into(),
                         name: name.as_str().into(),
                         monitor: mon.as_ref().map(|(name, _)| name.clone()),
                         is_active: mon.is_some_and(|(_, active_id)| active_id == id),

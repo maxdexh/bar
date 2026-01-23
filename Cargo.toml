@@ -10,11 +10,9 @@ crossterm = { version = "0.29.0", default-features = false, features = [
 ] }
 
 anyhow = "1.0.100"
-chrono = { version = "0.4.42", default-features = false }
+chrono = { version = "0.4.43", default-features = false }
 flexi_logger = "0.31.7"
 futures = { version = "0.3.31", default-features = false }
-
-#NOTE: Hyprland uses the wrong event listener socket path on 0.3.13
 hyprland = { version = "0.4.0-beta.3", features = [
     "async-lite",
     "listener",
@@ -25,20 +23,19 @@ image = { version = "0.25.9", default-features = false, features = [
 ] }
 log = "0.4.29"
 serde = { version = "1.0.228", features = ["rc"] }
-tokio = { version = "1.48.0", features = [
+tokio = { version = "1.49.0", features = [
     "macros",
     "net",
     "rt-multi-thread",
     "signal",
 ] }
-zbus = "5.12.0"
+zbus = "5.13.2"
 ppd = { version = "0.1.7", features = ["tokio"] }
 libpulse-binding = "2.30.1"
 postcard = { version = "1.1.3", features = ["alloc", "use-std"] }
 tempfile = "3.24.0"
-system-tray = { git = "https://github.com/maxdexh/system-tray", rev = "b044405df25afab772b2771e64303864d648fceb" }
-serde_json = { version = "1.0.148", features = ["raw_value"] }
+system-tray = "0.8.5"
+serde_json = { version = "1.0.149", features = ["raw_value"] }
 base64 = "0.22.1"
 tokio-util = { version = "0.7.18", features = ["rt", "time"] }
-pin-project-lite = "0.2.16"
 unicode-width = "0.2.2"

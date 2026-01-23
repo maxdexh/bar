@@ -12,6 +12,11 @@ impl From<String> for WorkspaceId {
         Self(value.into())
     }
 }
+impl WorkspaceId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct BasicWorkspace {

@@ -134,9 +134,18 @@ async fn hypr_module(
                 tui::Elem::from(tui::RawPrint::plain(&ws.name).styled(tui::Style {
                     fg: ws.is_active.then_some(tui::Color::Green),
                     ..Default::default()
-                })),
-                // TODO: Switch ws on lclick
-                // TODO: Show workspace info on rclick/hover
+                }))
+                .on_interact(tui::InteractCallback::from_fn_ctx(
+                    (hypr.clone(), ws.id.clone()),
+                    move |(hypr, ws), interact| match interact.kind {
+                        tui::InteractKind::Click(tui::MouseButton::Left) => {
+                            hypr.switch_workspace(ws.clone());
+                        }
+                        _ => {
+                            // TODO: Show workspace info on rclick/hover
+                        }
+                    },
+                )),
             ));
             wss.push(tui::StackItem::spacing(1));
         }
