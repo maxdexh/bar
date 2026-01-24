@@ -279,13 +279,6 @@ impl StackItem {
     }
 }
 
-// FIXME: Remove
-// TODO: Tagging system for partial updates?
-#[derive(Debug)]
-pub struct Tui {
-    pub root: Box<Elem>,
-}
-
 #[derive(Default, Debug, Clone, Copy)]
 pub struct Style {
     pub fg: Option<Color>,

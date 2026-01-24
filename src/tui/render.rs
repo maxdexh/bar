@@ -18,34 +18,33 @@ pub struct SizingArgs {
     pub font_size: Vec2<u16>,
 }
 
-impl Tui {
-    pub fn calc_min_size(&self, args: &SizingArgs) -> Vec2<u16> {
-        self.root.calc_min_size(args)
-    }
-    pub fn render(
-        &self,
-        area: Area,
-        writer: &mut impl Write,
-        sizing: &SizingArgs,
-    ) -> std::io::Result<RenderedLayout> {
-        crossterm::queue!(
-            writer,
-            crossterm::terminal::BeginSynchronizedUpdate,
-            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-        )?;
-        let mut layout = RenderedLayout::default();
-        self.root.render(
-            &mut RenderCtx {
-                sizing,
-                writer: &mut *writer,
-                layout: &mut layout,
-            },
-            area,
-        )?;
-        crossterm::execute!(writer, crossterm::terminal::EndSynchronizedUpdate)?;
-        Ok(layout)
-    }
+pub fn calc_min_size(elem: &Elem, args: &SizingArgs) -> Vec2<u16> {
+    elem.calc_min_size(args)
 }
+pub fn render(
+    elem: &Elem,
+    area: Area,
+    writer: &mut impl Write,
+    sizing: &SizingArgs,
+) -> std::io::Result<RenderedLayout> {
+    crossterm::queue!(
+        writer,
+        crossterm::terminal::BeginSynchronizedUpdate,
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+    )?;
+    let mut layout = RenderedLayout::default();
+    elem.render(
+        &mut RenderCtx {
+            sizing,
+            writer: &mut *writer,
+            layout: &mut layout,
+        },
+        area,
+    )?;
+    crossterm::execute!(writer, crossterm::terminal::EndSynchronizedUpdate)?;
+    Ok(layout)
+}
+
 impl Render for Elem {
     fn render(&self, ctx: &mut RenderCtx<impl Write>, area: Area) -> std::io::Result<()> {
         if let Some(callback) = self.on_interact.clone() {

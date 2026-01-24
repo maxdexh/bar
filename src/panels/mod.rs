@@ -43,7 +43,7 @@ pub enum BarTuiElem {
     ByMonitor(HashMap<Arc<str>, tui::StackItem>),
     Hide,
 }
-fn gather_bar_tui(bar_tui: &[BarTuiElem], monitor: &MonitorInfo) -> tui::Tui {
+fn gather_bar_tui(bar_tui: &[BarTuiElem], monitor: &MonitorInfo) -> tui::Elem {
     let mut parts = Vec::new();
     for elem in bar_tui {
         let elem = match elem {
@@ -54,9 +54,7 @@ fn gather_bar_tui(bar_tui: &[BarTuiElem], monitor: &MonitorInfo) -> tui::Tui {
         parts.extend(elem);
     }
     parts.push(tui::StackItem::spacing(1));
-    tui::Tui {
-        root: Box::new(tui::Stack::horizontal(parts).into()),
-    }
+    tui::Stack::horizontal(parts).into()
 }
 
 pub async fn run_manager(
@@ -347,7 +345,7 @@ async fn run_monitor(
 
         #[derive(Debug)]
         struct ShowMenu {
-            tui: tui::Tui,
+            tui: tui::Elem,
             kind: MenuKind,
             location: tui::Vec2<u32>,
             cached_tui_size: tui::Vec2<u16>,
@@ -370,20 +368,19 @@ async fn run_monitor(
                 Upd::BarTui => {
                     let tui = gather_bar_tui(&bar_tui_rx.borrow_and_update(), &monitor);
                     let mut buf = Vec::new();
-                    let Some(layout) = tui
-                        .render(
-                            tui::Area {
-                                size: bar.sizes.cell_size,
-                                pos: Default::default(),
-                            },
-                            &mut buf,
-                            &tui::SizingArgs {
-                                font_size: bar.sizes.font_size(),
-                            },
-                        )
-                        .context("Failed to render bar")
-                        .ok_or_log()
-                    else {
+                    let Some(layout) = tui::render(
+                        &tui,
+                        tui::Area {
+                            size: bar.sizes.cell_size,
+                            pos: Default::default(),
+                        },
+                        &mut buf,
+                        &tui::SizingArgs {
+                            font_size: bar.sizes.font_size(),
+                        },
+                    )
+                    .context("Failed to render bar")
+                    .ok_or_log() else {
                         continue;
                     };
                     bar.layout = layout;
@@ -394,16 +391,15 @@ async fn run_monitor(
                 Upd::Term(term_kind, ev) => match ev {
                     TermEvent::Crossterm(ev) => match ev {
                         crossterm::event::Event::Mouse(ev) => {
-                            if let Some((_, kind, callback)) = bar.layout.interpret_mouse_event(
+                            if let Some((interact, callback)) = bar.layout.interpret_mouse_event(
                                 ev,
                                 bar.sizes.font_size(),
                                 monitor.name.clone(),
                             ) {
                                 if let Some(callback) = callback {
-                                    // FIXME: Run callbacks on dedicated thread.
-                                    callback();
+                                    tokio::task::spawn_blocking(move || callback(interact));
                                 } else if matches!(term_kind, TermKind::Bar) {
-                                    let hide = match kind {
+                                    let hide = match interact.kind {
                                         tui::InteractKind::Hover => {
                                             show_menu.as_ref().is_some_and(|it| match it.kind {
                                                 MenuKind::Tooltip => true,
@@ -447,14 +443,11 @@ async fn run_monitor(
                     menu_kind,
                     monitor: _,
                 }) => {
-                    let tui = tui::Tui {
-                        root: Box::new(tui),
-                    };
                     let sizing = tui::SizingArgs {
                         font_size: menu.sizes.font_size(),
                     };
                     show_menu = Some(ShowMenu {
-                        cached_tui_size: tui.calc_min_size(&sizing),
+                        cached_tui_size: tui::calc_min_size(&tui, &sizing),
                         sizing,
                         tui,
                         kind: menu_kind,
@@ -556,20 +549,20 @@ async fn run_monitor(
                 // which would cause issues if passing the terminal's size here.
                 // Passing the tui's desired size sidesteps this because kitty
                 // will rerender it correctly once the resize is done.
-                if let Some(layout) = tui
-                    .render(
-                        tui::Area {
-                            size: cached_tui_size,
-                            pos: tui::Vec2 {
-                                x: HORIZONTAL_PADDING / 2,
-                                y: 0,
-                            },
+                if let Some(layout) = tui::render(
+                    tui,
+                    tui::Area {
+                        size: cached_tui_size,
+                        pos: tui::Vec2 {
+                            x: HORIZONTAL_PADDING / 2,
+                            y: 0,
                         },
-                        &mut buf,
-                        sizing,
-                    )
-                    .context("Failed to draw menu")
-                    .ok_or_log()
+                    },
+                    &mut buf,
+                    sizing,
+                )
+                .context("Failed to draw menu")
+                .ok_or_log()
                 {
                     menu.layout = layout;
                     menu.term_upd_tx.send(TermUpdate::Print(buf)).ok_or_log();

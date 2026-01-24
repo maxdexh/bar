@@ -79,7 +79,10 @@ impl RenderedLayout {
         event: crossterm::event::MouseEvent,
         font_size: Vec2<u16>,
         monitor: Arc<str>,
-    ) -> Option<(Vec2<u32>, InteractKind, Option<impl FnOnce()>)> {
+    ) -> Option<(
+        InteractData,
+        Option<impl Fn(InteractData) + 'static + Send + Sync>,
+    )> {
         use crossterm::event::*;
 
         let MouseEvent {
@@ -132,18 +135,13 @@ impl RenderedLayout {
         };
 
         Some((
-            location,
-            kind.clone(),
-            cb.cloned().map(move |cb| {
-                move || {
-                    cb.0(InteractData {
-                        location,
-                        monitor,
-                        kind,
-                        _p: (),
-                    })
-                }
-            }),
+            InteractData {
+                location,
+                monitor,
+                kind,
+                _p: (),
+            },
+            cb.cloned().map(|cb| move |interact| cb.0(interact)),
         ))
     }
 }
