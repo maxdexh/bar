@@ -77,12 +77,16 @@ async fn run_bg(
         let (tx, rx) = unb_chan();
 
         // Minimize lagged events
-        let event_rx = client.subscribe();
+        let mut event_rx = client.subscribe();
         tasks.spawn(async move {
-            tokio::pin!(event_rx);
-            while let Ok(ev) = event_rx.recv().await
-                && tx.send(ev).is_ok()
-            {}
+            while match event_rx.recv().await {
+                Ok(ev) => tx.send(ev).is_ok(),
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    log::warn!("Lagged {n} events from system-tray client");
+                    true
+                }
+            } {}
         });
 
         tasks.spawn(run_state_fetcher(client.items(), rx, state_tx, reload_rx));
