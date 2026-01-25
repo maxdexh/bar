@@ -42,7 +42,7 @@ async fn main_inner() {
 async fn exit_signal() {
     use tokio::signal::unix::SignalKind;
     let mut tasks = tokio::task::JoinSet::new();
-    for signal in [
+    for kind in [
         SignalKind::interrupt(),
         SignalKind::quit(),
         SignalKind::alarm(),
@@ -52,8 +52,14 @@ async fn exit_signal() {
         SignalKind::user_defined1(),
         SignalKind::user_defined2(),
     ] {
-        if let Some(mut signal) = utils::ResultExt::ok_or_log(tokio::signal::unix::signal(signal)) {
-            tasks.spawn(async move { signal.recv().await.is_some() });
+        if let Some(mut signal) = utils::ResultExt::ok_or_log(tokio::signal::unix::signal(kind)) {
+            tasks.spawn(async move {
+                let exit = signal.recv().await.is_some();
+                if exit {
+                    log::debug!("Exiting for signal {kind:?}");
+                }
+                exit
+            });
         }
     }
     loop {

@@ -579,11 +579,11 @@ async fn run_monitor(
             .await
             .with_context(|| {
                 format!(
-                    "Failed to run panels for monitor {}. Retrying in 5s",
+                    "Failed to run panels for monitor {}. Retrying in 30s",
                     monitor.name
                 )
             })
             .ok_or_log();
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
