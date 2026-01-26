@@ -1,11 +1,12 @@
+use anyhow::Context;
 use tokio_util::sync::CancellationToken;
 
 mod reload;
 pub use reload::*;
 mod channels;
 pub use channels::*;
-mod callback;
-pub use callback::*;
+mod dbg;
+pub use dbg::*;
 
 pub trait ResultExt {
     type Ok;
@@ -36,6 +37,33 @@ impl<T, E: Into<anyhow::Error>> ResultExt for Result<T, E> {
                 log::debug!("{:?}", err.into());
                 None
             }
+        }
+    }
+}
+
+pub async fn run_or_retry<T, E, A>(
+    mut f: impl AsyncFnMut(&mut A) -> Result<T, E>,
+    mut args: A,
+    mut ctx: impl FnMut(Result<T, E>) -> anyhow::Result<T>,
+    timeout: std::time::Duration,
+    mut reload_rx: Option<&mut ReloadRx>,
+) -> T {
+    loop {
+        let res = ctx(f(&mut args).await)
+            .with_context(|| format!("Failed to run task. Retrying in {}s", timeout.as_secs()))
+            .ok_or_log();
+
+        if let Some(init) = res {
+            return init;
+        }
+
+        // TODO: Once we have a way to manually reload, add exponential backoff
+        tokio::select! {
+            () = tokio::time::sleep(timeout) => {}
+            Some(()) = async {
+                let reload_rx = reload_rx.as_deref_mut()?;
+                reload_rx.wait().await
+            } => {}
         }
     }
 }

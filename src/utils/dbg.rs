@@ -1,53 +1,53 @@
 use std::{fmt, sync::Arc};
 
-pub struct Callback<T, R> {
-    cb: Arc<dyn Fn(T) -> R + 'static + Send + Sync>,
+#[derive(Clone)]
+pub struct Dbg<T> {
+    pub inner: T,
     #[cfg(debug_assertions)]
     dbg: (&'static str, &'static std::panic::Location<'static>),
 }
-impl<T, R> Clone for Callback<T, R> {
-    fn clone(&self) -> Self {
-        Self {
-            cb: self.cb.clone(),
-            #[cfg(debug_assertions)]
-            dbg: self.dbg,
-        }
-    }
-}
-impl<T, R> fmt::Debug for Callback<T, R> {
+impl<T> fmt::Debug for Dbg<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut dbg = f.debug_tuple(std::any::type_name::<Self>());
 
         #[cfg(debug_assertions)]
         dbg.field(&fmt::from_fn(|f| {
-            let (fn_type_name, fn_location) = self.dbg;
-            write!(f, "{fn_type_name} @ {fn_location}")
+            let (original_type, fn_location) = self.dbg;
+            write!(f, "{original_type} @ {fn_location}")
         }));
 
         dbg.finish()
     }
 }
-impl<T, R> Callback<T, R> {
-    #[inline]
-    #[cfg_attr(debug_assertions, track_caller)]
-    pub fn from_fn_base<Base, F>(base: Base, to_callback: impl FnOnce(Base) -> F) -> Self
-    where
-        F: Fn(T) -> R + 'static + Send + Sync,
-    {
+impl<T> Dbg<T> {
+    pub fn new<Original>(original: Original, to_inner: impl FnOnce(Original) -> T) -> Self {
         Self {
-            cb: Arc::new(to_callback(base)),
+            inner: to_inner(original),
             #[cfg(debug_assertions)]
             dbg: (
-                std::any::type_name::<Base>(),
+                std::any::type_name::<Original>(),
                 std::panic::Location::caller(),
             ),
         }
     }
+}
 
+pub struct Callback<T, R>(Dbg<Arc<dyn Fn(T) -> R + 'static + Send + Sync>>);
+impl<T, R> Clone for Callback<T, R> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl<T, R> fmt::Debug for Callback<T, R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, f)
+    }
+}
+impl<T, R> Callback<T, R> {
     #[inline]
     #[cfg_attr(debug_assertions, track_caller)]
     pub fn from_fn(callback: impl Fn(T) -> R + 'static + Send + Sync) -> Self {
-        Self::from_fn_base(callback, |cb| cb)
+        Self(Dbg::new(callback, |cb| Arc::new(cb) as _))
     }
 
     #[inline]
@@ -56,11 +56,13 @@ impl<T, R> Callback<T, R> {
         ctx: C,
         callback: impl Fn(&C, T) -> R + 'static + Send + Sync,
     ) -> Self {
-        Self::from_fn_base(callback, move |cb| move |arg| cb(&ctx, arg))
+        Self(Dbg::new(callback, |cb| {
+            Arc::new(move |arg| cb(&ctx, arg)) as _
+        }))
     }
 
     pub fn call(&self, arg: T) -> R {
-        (self.cb)(arg)
+        (self.0.inner)(arg)
     }
 }
 impl<T, R> From<&Callback<T, R>> for Callback<T, R> {

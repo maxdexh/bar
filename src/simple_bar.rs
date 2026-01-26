@@ -490,25 +490,17 @@ async fn tray_module(
                         if let tui::InteractKind::Click(tui::MouseButton::Left) = interact.kind {
                             let addr = addr.clone();
                             let menu_path = menu_path.clone();
-                            tray.client_sched_tx
-                                .send(ClientCallback::from_fn(move |client| {
-                                    let addr = addr.clone();
-                                    let menu_path = Arc::clone(&menu_path);
-                                    tokio::spawn(async move {
-                                        client
-                                            .activate(
-                                                system_tray::client::ActivateRequest::MenuItem {
-                                                    address: str::to_owned(&addr),
-                                                    menu_path: str::to_owned(&menu_path),
-                                                    submenu_id: id,
-                                                },
-                                            )
-                                            .await
-                                            .context("Failed to send ActivateRequest")
-                                            .ok_or_log();
-                                    });
-                                }))
-                                .ok_or_debug();
+                            tray.sched_with_client(async move |client| {
+                                client
+                                    .activate(system_tray::client::ActivateRequest::MenuItem {
+                                        address: str::to_owned(&addr),
+                                        menu_path: str::to_owned(&menu_path),
+                                        submenu_id: id,
+                                    })
+                                    .await
+                                    .context("Failed to send ActivateRequest")
+                                    .ok_or_log();
+                            });
                         }
                         None
                     })

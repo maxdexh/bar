@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
 
-use crate::utils::Callback;
+use crate::utils::run_or_retry;
 use crate::utils::{ReloadRx, ResultExt, UnbTx, WatchRx, unb_chan, watch_chan};
 use crate::utils::{ReloadTx, WatchTx};
 
@@ -25,11 +25,26 @@ pub struct TrayMenuExt {
     pub submenus: Vec<system_tray::menu::MenuItem>,
 }
 
-pub type ClientCallback = Callback<Arc<system_tray::client::Client>, ()>;
+type ClientCallback = Box<dyn FnOnce(Arc<system_tray::client::Client>) + Send + 'static>;
+#[derive(Debug)]
 pub struct TrayClient {
     pub state_rx: WatchRx<TrayState>,
-    pub client_sched_tx: UnbTx<ClientCallback>,
+    client_sched_tx: UnbTx<ClientCallback>,
     _background: AbortOnDropHandle<()>,
+}
+impl TrayClient {
+    #[track_caller]
+    pub fn sched_with_client<Fut: Future<Output = ()> + Send + 'static>(
+        &self,
+        f: impl FnOnce(Arc<system_tray::client::Client>) -> Fut + Send + 'static,
+    ) {
+        self.client_sched_tx
+            .send(Box::new(|client| {
+                tokio::spawn(f(client));
+            }))
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .ok_or_debug();
+    }
 }
 pub fn connect(reload_rx: ReloadRx) -> TrayClient {
     let (state_tx, state_rx) = watch_chan(Default::default());
@@ -49,64 +64,59 @@ async fn run_bg(
     client_sched_rx: impl Stream<Item = ClientCallback> + Send + 'static,
     mut reload_rx: ReloadRx,
 ) {
-    let client = loop {
-        match system_tray::client::Client::new().await {
-            Ok(it) => break it,
-            res @ Err(_) => {
-                res.context("Failed to connect to system tray").ok_or_log();
-
-                tokio::select! {
-                    () = tokio::time::sleep(Duration::from_secs(90)) => (),
-                    Some(()) = reload_rx.wait() => (),
-                }
-            }
-        }
-    };
+    let client = run_or_retry(
+        |_: &mut ()| system_tray::client::Client::new(),
+        (),
+        |res| res.context("Failed to initialize tray client"),
+        Duration::from_secs(90),
+        Some(&mut reload_rx),
+    )
+    .await;
 
     let mut tasks = JoinSet::<()>::new();
 
-    {
-        let mut event_reload_tx = ReloadTx::new();
-        let event_reload_rx = event_reload_tx.subscribe();
+    let event_reload_tx = ReloadTx::new();
+    let event_reload_rx = event_reload_tx.subscribe();
 
-        // Minimize lagged events
-        let mut event_rx = client.subscribe();
-        tasks.spawn(async move {
-            loop {
-                if let Err(broadcast::error::RecvError::Closed) = event_rx.recv().await {
-                    return;
-                }
+    tasks.spawn(events_to_reloads(event_reload_tx, client.subscribe()));
 
-                let debounce = tokio::time::sleep(Duration::from_millis(50));
-                tokio::pin!(debounce);
-                loop {
-                    tokio::select! {
-                        res = event_rx.recv() => {
-                            if let Err(broadcast::error::RecvError::Closed) = res {
-                                return;
-                            }
-                        }
-                        () = &mut debounce => break,
-                    }
-                }
+    tasks.spawn(run_state_fetcher(
+        client.items(),
+        event_reload_rx,
+        state_tx,
+        reload_rx,
+    ));
 
-                event_reload_tx.reload();
-            }
-        });
-
-        tasks.spawn(run_state_fetcher(
-            client.items(),
-            event_reload_rx,
-            state_tx,
-            reload_rx,
-        ));
-    }
     tasks.spawn(run_client_sched(client, client_sched_rx));
 
     if let Some(res @ Err(_)) = tasks.join_next().await {
         res.context("Systray module failed").ok_or_log();
     }
 }
+
+async fn events_to_reloads(mut tx: ReloadTx, mut rx: broadcast::Receiver<impl Clone>) {
+    loop {
+        if let Err(broadcast::error::RecvError::Closed) = rx.recv().await {
+            return;
+        }
+
+        let debounce = tokio::time::sleep(Duration::from_millis(50));
+        tokio::pin!(debounce);
+        loop {
+            tokio::select! {
+                res = rx.recv() => {
+                    if let Err(broadcast::error::RecvError::Closed) = res {
+                        return;
+                    }
+                }
+                () = &mut debounce => break,
+            }
+        }
+
+        tx.reload();
+    }
+}
+
 async fn run_state_fetcher(
     state_mutex: Arc<std::sync::Mutex<system_tray::data::BaseMap>>,
     mut event_reload_rx: ReloadRx,
@@ -120,7 +130,7 @@ async fn run_state_fetcher(
         let mut menus = HashMap::with_capacity(lock.len());
 
         for (addr, (item, menu)) in &*lock {
-            let addr = Arc::<str>::from(addr.as_str());
+            let addr: Arc<str> = addr.as_str().into();
             if let Some(menu) = &menu {
                 menus.insert(
                     addr.clone(),
@@ -135,13 +145,6 @@ async fn run_state_fetcher(
         }
         (items, menus)
     };
-    let fetch = || async {
-        tokio::task::spawn_blocking(fetch_blocking.clone())
-            .await
-            .ok_or_log()
-    };
-
-    //let mut menu_paths = HashMap::new();
 
     loop {
         tokio::select! {
@@ -149,7 +152,8 @@ async fn run_state_fetcher(
             Some(()) = reload_rx.wait() => {},
         }
 
-        let Some((items, menus)) = fetch().await else {
+        let task = tokio::task::spawn_blocking(fetch_blocking.clone());
+        let Some((items, menus)) = task.await.ok_or_log() else {
             continue;
         };
         state_tx.send_replace(TrayState { items, menus });
@@ -162,8 +166,7 @@ async fn run_client_sched(
     let client = Arc::new(client);
     tokio::pin!(cb_rx);
     while let Some(cb) = cb_rx.next().await {
-        let client = client.clone();
-        tokio::task::spawn_blocking(move || cb.call(client));
+        cb(client.clone());
     }
     log::warn!("Tray interact stream was closed");
 }

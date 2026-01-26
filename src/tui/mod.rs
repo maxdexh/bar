@@ -53,7 +53,9 @@ impl Elem {
     }
     pub fn with_hovered(mut self, hovered: impl Into<Elem>) -> Self {
         self.assign_hover_id();
-        self.hovered = Some(Arc::new(hovered.into()));
+        let mut hovered = hovered.into();
+        hovered.hover_id = self.hover_id;
+        self.hovered = Some(Arc::new(hovered));
         self
     }
 }
