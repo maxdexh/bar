@@ -171,6 +171,7 @@ async fn run_state_fetcher(
         state_tx.send_replace(TrayState { items, menus });
     }
 }
+// FIXME: Move to bar
 async fn run_menu_interaction(
     client: system_tray::client::Client,
     interact_rx: impl Stream<Item = TrayMenuInteract>,
@@ -196,10 +197,9 @@ async fn run_menu_interaction(
                     .context("Failed to send ActivateRequest")
                     .ok_or_log();
             }
-            tui::InteractKind::Hover => {
-                // TODO: Highlight
+            _ => {
+                //
             }
-            _ => (),
         }
     }
     log::warn!("Tray interact stream was closed");

@@ -5,20 +5,18 @@ use tokio::task::JoinSet;
 
 use crate::{
     clients,
-    panels::{self, BarTuiElem, MenuKind, OpenMenu},
+    panels::{self, BarTuiElem},
     tui,
-    utils::{ReloadRx, ReloadTx, ResultExt, UnbTx, WatchRx, WatchTx, unb_chan, watch_chan},
+    utils::{ReloadRx, ReloadTx, ResultExt, WatchRx, WatchTx, watch_chan},
 };
 
 struct ModuleArgs {
-    menu_tx: UnbTx<OpenMenu>,
     tui_tx: WatchTx<BarTuiElem>,
     reload_rx: ReloadRx,
     _unused: (),
 }
 
 struct BarModuleFactory {
-    menu_tx: UnbTx<OpenMenu>,
     reload_tx: ReloadTx,
     tasks: JoinSet<()>,
 }
@@ -29,7 +27,6 @@ impl BarModuleFactory {
     ) -> WatchRx<BarTuiElem> {
         let (tui_tx, tui_rx) = watch_chan(BarTuiElem::Hide);
         self.tasks.spawn(task(ModuleArgs {
-            menu_tx: self.menu_tx.clone(),
             reload_rx: self.reload_tx.subscribe(),
             tui_tx,
             _unused: (),
@@ -55,15 +52,9 @@ pub async fn main2() {
     let mut reload_tx = ReloadTx::new();
 
     let bar_tx = WatchTx::new(Vec::new());
-    let (menu_tx, menu_rx) = unb_chan();
-    tasks.spawn(panels::run_manager(
-        bar_tx.subscribe(),
-        menu_rx,
-        reload_tx.clone(),
-    ));
+    tasks.spawn(panels::run_manager(bar_tx.subscribe(), reload_tx.clone()));
 
     let mut fac = BarModuleFactory {
-        menu_tx,
         reload_tx: reload_tx.clone(),
         tasks: JoinSet::new(),
     };
@@ -130,22 +121,28 @@ async fn hypr_module(
                 continue;
             };
             let wss = by_monitor.entry(monitor).or_insert_with(Vec::new);
-            wss.push(tui::StackItem::auto(
-                tui::Elem::from(tui::RawPrint::plain(&ws.name).styled(tui::Style {
-                    fg: ws.is_active.then_some(tui::Color::Green),
-                    ..Default::default()
-                }))
-                .on_interact(tui::InteractCallback::from_fn_ctx(
-                    (hypr.clone(), ws.id.clone()),
-                    move |(hypr, ws), interact| match interact.kind {
+
+            let on_interact = tui::InteractCallback::from_fn_ctx(
+                (hypr.clone(), ws.id.clone()),
+                move |(hypr, ws), interact| {
+                    match interact.kind {
                         tui::InteractKind::Click(tui::MouseButton::Left) => {
                             hypr.switch_workspace(ws.clone());
                         }
                         _ => {
                             // TODO: Show workspace info on rclick/hover
                         }
-                    },
-                )),
+                    }
+                    None
+                },
+            );
+
+            wss.push(tui::StackItem::auto(
+                tui::Elem::from(tui::RawPrint::plain(&ws.name).styled(tui::Style {
+                    fg: ws.is_active.then_some(tui::Color::Green),
+                    ..Default::default()
+                }))
+                .with_interact(on_interact),
             ));
             wss.push(tui::StackItem::spacing(1));
         }
@@ -161,86 +158,68 @@ async fn time_module(
     ModuleArgs {
         tui_tx,
         mut reload_rx,
-        menu_tx,
         ..
     }: ModuleArgs,
 ) {
     use chrono::{Datelike, Timelike};
     use std::time::Duration;
 
-    let on_interact = tui::InteractCallback::from_fn(move |interact| match interact.kind {
-        tui::InteractKind::Hover => {
-            let now = chrono::Local::now().date_naive();
-            let title = now.format("%B %Y").to_string();
+    let tooltip = tui::HoverCallback::from_fn(move |_| {
+        let now = chrono::Local::now().date_naive();
+        let title = now.format("%B %Y").to_string();
 
-            let Some(first_day_offset) = now
-                .with_day(1)
-                .map(|first| first.weekday() as u16)
-                .context("Failed to set day")
-                .ok_or_log()
-            else {
-                return;
-            };
+        let first_day_offset = now
+            .with_day(1)
+            .map(|first| first.weekday() as u16)
+            .context("Failed to set day")
+            .ok_or_log()?;
 
-            let num_weeks = usize::div_ceil(
-                usize::from(now.num_days_in_month()) + usize::from(first_day_offset),
-                7,
-            );
-            let mut lines = vec![vec![[tui::StackItem::spacing(2)]; 7]; num_weeks];
+        let num_weeks = usize::div_ceil(
+            usize::from(now.num_days_in_month()) + usize::from(first_day_offset),
+            7,
+        );
+        let mut lines = vec![vec![[tui::StackItem::spacing(2)]; 7]; num_weeks];
 
-            for n0 in 0u16..now.num_days_in_month().into() {
-                let n1 = n0 + 1;
-                let Some(day) = now
-                    .with_day(n1.into())
-                    .with_context(|| format!("Failed to set day {n1}"))
-                    .ok_or_log()
-                else {
-                    return;
-                };
-                let week_in_month = (first_day_offset + n0) / 7;
-                let item = &mut lines[usize::from(week_in_month)][day.weekday() as usize];
-                *item = [tui::StackItem::auto({
-                    let it = tui::RawPrint::plain(format!("{n1:>2}"));
-                    if now == day {
-                        it.styled(tui::Style {
-                            fg: Some(tui::Color::Green),
-                            ..Default::default()
-                        })
-                        .map_display(|styled| styled.to_string())
-                    } else {
-                        it
-                    }
-                })];
-            }
-            let weekday_line = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
-                .map(|d| [tui::StackItem::auto(tui::RawPrint::plain(d))])
-                .into();
+        for n0 in 0u16..now.num_days_in_month().into() {
+            let n1 = n0 + 1;
+            let day = now
+                .with_day(n1.into())
+                .with_context(|| format!("Failed to set day {n1}"))
+                .ok_or_log()?;
 
-            let title = tui::StackItem::auto(tui::RawPrint::plain(title).styled(tui::Style {
-                modifier: tui::Modifier {
-                    bold: true,
-                    ..Default::default()
-                },
+            let week_in_month = (first_day_offset + n0) / 7;
+            let item = &mut lines[usize::from(week_in_month)][day.weekday() as usize];
+            *item = [tui::StackItem::auto({
+                let it = tui::RawPrint::plain(format!("{n1:>2}"));
+                if now == day {
+                    it.styled(tui::Style {
+                        fg: Some(tui::Color::Green),
+                        ..Default::default()
+                    })
+                    .map_display(|styled| styled.to_string())
+                } else {
+                    it
+                }
+            })];
+        }
+        let weekday_line = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
+            .map(|d| [tui::StackItem::auto(tui::RawPrint::plain(d))])
+            .into();
+
+        let title = tui::StackItem::auto(tui::RawPrint::plain(title).styled(tui::Style {
+            modifier: tui::Modifier {
+                bold: true,
                 ..Default::default()
-            }));
-            let mut parts = vec![title];
-            for line in std::iter::once(weekday_line).chain(lines) {
-                let line = line.join(&tui::StackItem::spacing(1));
-                let line = tui::Stack::horizontal(line);
-                parts.push(tui::StackItem::auto(line));
-            }
-            menu_tx
-                .send(OpenMenu {
-                    monitor: interact.monitor,
-                    tui: tui::Stack::vertical(parts).into(),
-                    pix_location: interact.pix_location,
-                    menu_kind: MenuKind::Tooltip,
-                })
-                .ok_or_debug();
+            },
+            ..Default::default()
+        }));
+        let mut parts = vec![title];
+        for line in std::iter::once(weekday_line).chain(lines) {
+            let line = line.join(&tui::StackItem::spacing(1));
+            let line = tui::Stack::horizontal(line);
+            parts.push(tui::StackItem::auto(line));
         }
-        _ => {
-            //
-        }
+        Some(tui::Stack::vertical(parts).into())
     });
 
     let mut prev_minutes = 61;
@@ -250,7 +229,7 @@ async fn time_module(
         if prev_minutes != minute {
             let tui = tui::RawPrint::plain(now.format("%H:%M %d/%m").to_string());
             tui_tx.send_replace(BarTuiElem::Shared(tui::StackItem::auto(
-                tui::Elem::from(tui).on_interact(on_interact.clone()),
+                tui::Elem::from(tui).with_tooltip(&tooltip),
             )));
 
             prev_minutes = minute;
@@ -307,10 +286,11 @@ async fn pulse_module(
                                 tui::Direction::Right => 1,
                             },
                         ),
-                        _ => return,
+                        _ => return None,
                     },
                 })
                 .ok_or_log();
+            None
         }
     });
 
@@ -332,56 +312,40 @@ async fn pulse_module(
                     (volume * 100.0).round() as u32
                 ))),
             ]))
-            .on_interact(on_interact.clone()),
+            .with_interact(&on_interact),
         )));
     }
 }
 async fn energy_module(
     ModuleArgs {
-        tui_tx,
-        menu_tx,
-        reload_rx,
-        ..
+        tui_tx, reload_rx, ..
     }: ModuleArgs,
 ) {
     use crate::clients::upower::*;
     let energy = Arc::new(clients::upower::connect(reload_rx));
 
-    let on_interact = {
-        let menu_tx = menu_tx.clone();
-
-        tui::InteractCallback::from_fn_ctx(energy.clone(), move |energy, interact| {
-            if let tui::InteractKind::Hover = interact.kind {
-                let text = {
-                    let lock = energy.state_rx.borrow();
-                    let display_time = |time: std::time::Duration| {
-                        let hours = time.as_secs() / 3600;
-                        let mins = (time.as_secs() / 60) % 60;
-                        format!("{hours}h {mins}min")
-                    };
-                    match lock.battery_state {
-                        BatteryState::Discharging | BatteryState::PendingDischarge => {
-                            format!("Battery empty in {}", display_time(lock.time_to_empty))
-                        }
-                        BatteryState::FullyCharged => "Battery full".to_owned(),
-                        BatteryState::Empty => "Battery empty".to_owned(),
-                        BatteryState::Unknown => "Battery state unknown".to_owned(),
-                        BatteryState::Charging | BatteryState::PendingCharge => {
-                            format!("Battery full in {}", display_time(lock.time_to_full))
-                        }
-                    }
-                };
-                menu_tx
-                    .send(OpenMenu {
-                        monitor: interact.monitor,
-                        tui: tui::RawPrint::plain(text).into(),
-                        pix_location: interact.pix_location,
-                        menu_kind: MenuKind::Tooltip,
-                    })
-                    .ok_or_log();
+    let tooltip = tui::HoverCallback::from_fn_ctx(energy.clone(), |energy, _| {
+        let text = {
+            let lock = energy.state_rx.borrow();
+            let display_time = |time: std::time::Duration| {
+                let hours = time.as_secs() / 3600;
+                let mins = (time.as_secs() / 60) % 60;
+                format!("{hours}h {mins}min")
+            };
+            match lock.battery_state {
+                BatteryState::Discharging | BatteryState::PendingDischarge => {
+                    format!("Battery empty in {}", display_time(lock.time_to_empty))
+                }
+                BatteryState::FullyCharged => "Battery full".to_owned(),
+                BatteryState::Empty => "Battery empty".to_owned(),
+                BatteryState::Unknown => "Battery state unknown".to_owned(),
+                BatteryState::Charging | BatteryState::PendingCharge => {
+                    format!("Battery full in {}", display_time(lock.time_to_full))
+                }
             }
-        })
-    };
+        };
+        Some(tui::RawPrint::plain(text).into())
+    });
 
     let mut state_rx = energy.state_rx.clone();
     state_rx.mark_changed();
@@ -403,43 +367,31 @@ async fn energy_module(
         let energy = format!("{percentage:>3}% {rate:<6}");
 
         tui_tx.send_replace(BarTuiElem::Shared(tui::StackItem::auto(
-            tui::Elem::from(tui::RawPrint::plain(energy)).on_interact(on_interact.clone()),
+            tui::Elem::from(tui::RawPrint::plain(energy)).with_tooltip(&tooltip),
         )));
     }
 }
 async fn ppd_module(
     ModuleArgs {
-        tui_tx,
-        menu_tx,
-        reload_rx,
-        ..
+        tui_tx, reload_rx, ..
     }: ModuleArgs,
 ) {
     let ppd = Arc::new(clients::ppd::connect(reload_rx));
 
-    let on_interact = tui::InteractCallback::from_fn({
-        let menu_tx = menu_tx.clone();
-        let ppd = ppd.clone();
-        move |interact| {
-            let profile = ppd.profile_rx.borrow().clone();
-            match interact.kind {
-                tui::InteractKind::Click(tui::MouseButton::Left) => {
-                    ppd.cycle_profile();
-                }
-                tui::InteractKind::Hover => {
-                    menu_tx
-                        .send(OpenMenu {
-                            monitor: interact.monitor,
-                            tui: tui::PlainLines::new(profile.as_deref().unwrap_or("No profile"))
-                                .into(),
-                            pix_location: interact.pix_location,
-                            menu_kind: MenuKind::Tooltip,
-                        })
-                        .ok_or_log();
-                }
-                _ => (),
+    let tooltip = tui::HoverCallback::from_fn_ctx(ppd.clone(), |ppd, _| {
+        let profile = ppd.profile_rx.borrow().clone();
+        Some(tui::PlainLines::new(profile.as_deref().unwrap_or("No profile")).into())
+    });
+    let on_interact = tui::InteractCallback::from_fn_ctx(ppd.clone(), |ppd, interact| {
+        match interact.kind {
+            tui::InteractKind::Click(tui::MouseButton::Left) => {
+                ppd.cycle_profile();
+            }
+            _ => {
+                //
             }
         }
+        None
     });
 
     let mut profile_rx = ppd.profile_rx.clone();
@@ -460,133 +412,116 @@ async fn ppd_module(
             continue;
         };
 
-        let elem = tui::Elem::on_interact(icon, on_interact.clone());
+        let elem: tui::Elem = icon;
+        let elem = elem.with_tooltip(&tooltip).with_interact(&on_interact);
+
         tui_tx.send_replace(BarTuiElem::Shared(tui::StackItem::auto(elem)));
     }
 }
 
 async fn tray_module(
     ModuleArgs {
-        tui_tx,
-        menu_tx,
-        reload_rx,
-        ..
+        tui_tx, reload_rx, ..
     }: ModuleArgs,
 ) {
     use crate::clients::tray::*;
     let tray = Arc::new(clients::tray::connect(reload_rx));
 
-    let mk_interact_callback = |addr: Arc<str>| {
-        let tray = tray.clone();
-        let menu_tx = menu_tx.clone();
-        tui::InteractCallback::from_fn(move |interact| {
-            match interact.kind {
-                tui::InteractKind::Hover => {
-                    let items = tray.state_rx.borrow().items.clone();
+    let mk_interactivity = |addr: &Arc<str>, elem: tui::Elem| {
+        let tooltip =
+            tui::HoverCallback::from_fn_ctx((tray.clone(), addr.clone()), |(tray, addr), _| {
+                let items = tray.state_rx.borrow().items.clone();
 
-                    // FIXME: Handle more attrs
-                    let Some(system_tray::item::Tooltip {
-                        icon_name: _,
-                        icon_data: _,
-                        title,
-                        description,
-                    }) = items
-                        .get(&addr)
-                        .and_then(|item| item.tool_tip.as_ref())
-                        .with_context(|| format!("Unknown tray addr {addr}"))
-                        .ok_or_log()
-                    else {
-                        return;
-                    };
+                // FIXME: Handle more attrs
+                let system_tray::item::Tooltip {
+                    icon_name: _,
+                    icon_data: _,
+                    title,
+                    description,
+                } = items
+                    .get(addr)
+                    .and_then(|item| item.tool_tip.as_ref())
+                    .with_context(|| format!("Unknown tray addr {addr}"))
+                    .ok_or_log()?;
 
-                    let tui = tui::Stack::vertical([
-                        tui::StackItem::auto(tui::Stack::horizontal([
-                            tui::StackItem::new(tui::Constr::Fill(1), tui::Elem::empty()),
-                            tui::StackItem::auto(tui::PlainLines::new(title.as_str()).styled(
-                                tui::Style {
-                                    modifier: tui::Modifier {
-                                        bold: true,
-                                        ..Default::default()
-                                    },
+                let tui = tui::Stack::vertical([
+                    tui::StackItem::auto(tui::Stack::horizontal([
+                        tui::StackItem::new(tui::Constr::Fill(1), tui::Elem::empty()),
+                        tui::StackItem::auto(tui::PlainLines::new(title.as_str()).styled(
+                            tui::Style {
+                                modifier: tui::Modifier {
+                                    bold: true,
                                     ..Default::default()
                                 },
-                            )),
-                            tui::StackItem::new(tui::Constr::Fill(1), tui::Elem::empty()),
-                        ])),
-                        tui::StackItem::auto(tui::PlainLines::new(description.as_str())),
-                    ]);
-                    menu_tx
-                        .send(OpenMenu {
-                            monitor: interact.monitor,
-                            tui: tui.into(),
-                            pix_location: interact.pix_location,
-                            menu_kind: MenuKind::Tooltip,
-                        })
-                        .ok_or_log();
-                }
-                tui::InteractKind::Click(tui::MouseButton::Right) => {
-                    let Some(TrayMenuExt {
-                        menu_path,
-                        submenus,
-                        ..
-                    }) = tray
-                        .state_rx
-                        .borrow()
-                        .menus
-                        .get(&addr)
-                        .cloned()
-                        .with_context(|| format!("Unknown tray addr {addr}"))
-                        .ok_or_log()
-                    else {
-                        return;
-                    };
-
-                    let icb = {
-                        |menu_path, id| {
-                            let tray = tray.clone();
-                            let addr = addr.clone();
-                            let menu_path = Arc::clone(menu_path);
-                            tui::InteractCallback::from_fn(move |interact| {
-                                tray.menu_interact_tx
-                                    .send(TrayMenuInteract {
-                                        addr: addr.clone(),
-                                        menu_path: Arc::clone(&menu_path),
-                                        id,
-                                        kind: interact.kind,
-                                    })
-                                    .ok_or_log();
-                            })
-                        }
-                    };
-
-                    let tui = tui::Block {
-                        borders: tui::Borders::all(),
-                        border_style: tui::Style {
-                            fg: Some(tui::Color::DarkGrey),
-                            ..Default::default()
-                        },
-                        border_set: tui::LineSet::thick(),
-                        inner: Some(tray_menu_to_tui(
-                            0,
-                            &submenus,
-                            menu_path
-                                .as_ref()
-                                .map(|menu_path| |id| icb(menu_path, id))
-                                .as_ref(),
+                                ..Default::default()
+                            },
                         )),
-                    };
-                    menu_tx
-                        .send(OpenMenu {
-                            monitor: interact.monitor,
-                            tui: tui.into(),
-                            pix_location: interact.pix_location,
-                            menu_kind: MenuKind::Context,
+                        tui::StackItem::new(tui::Constr::Fill(1), tui::Elem::empty()),
+                    ])),
+                    tui::StackItem::auto(tui::PlainLines::new(description.as_str())),
+                ])
+                .into();
+
+                Some(tui)
+            });
+
+        let addr = addr.clone();
+        let tray = tray.clone();
+        let on_interact = tui::InteractCallback::from_fn(move |interact| match interact.kind {
+            tui::InteractKind::Click(tui::MouseButton::Right) => {
+                let TrayMenuExt {
+                    menu_path,
+                    submenus,
+                    ..
+                } = tray
+                    .state_rx
+                    .borrow()
+                    .menus
+                    .get(&addr)
+                    .cloned()
+                    .with_context(|| format!("Unknown tray addr {addr}"))
+                    .ok_or_log()?;
+
+                let icb = {
+                    |menu_path, id| {
+                        let tray = tray.clone();
+                        let addr = addr.clone();
+                        let menu_path = Arc::clone(menu_path);
+                        tui::InteractCallback::from_fn(move |interact| {
+                            tray.menu_interact_tx
+                                .send(TrayMenuInteract {
+                                    addr: addr.clone(),
+                                    menu_path: Arc::clone(&menu_path),
+                                    id,
+                                    kind: interact.kind,
+                                })
+                                .ok_or_log();
+                            None
                         })
-                        .ok_or_log();
-                }
-                _ => (),
+                    }
+                };
+
+                let tui = tui::Block {
+                    borders: tui::Borders::all(),
+                    border_style: tui::Style {
+                        fg: Some(tui::Color::DarkGrey),
+                        ..Default::default()
+                    },
+                    border_set: tui::LineSet::thick(),
+                    inner: Some(tray_menu_to_tui(
+                        0,
+                        &submenus,
+                        menu_path
+                            .as_ref()
+                            .map(|menu_path| |id| icb(menu_path, id))
+                            .as_ref(),
+                    )),
+                };
+                Some(tui.into())
             }
-        })
+            _ => None,
+        });
+        elem.with_interact(on_interact).with_tooltip(tooltip)
     };
 
     let mut state_rx = tray.state_rx.clone();
@@ -620,13 +555,14 @@ async fn tray_module(
                 }
 
                 parts.extend([
-                    tui::StackItem::auto(
-                        tui::Elem::from(tui::Image {
+                    tui::StackItem::auto(mk_interactivity(
+                        addr,
+                        tui::Image {
                             img,
                             sizing: tui::ImageSizeMode::FillAxis(tui::Axis::Y, 1),
-                        })
-                        .on_interact(mk_interact_callback(addr.clone())),
-                    ),
+                        }
+                        .into(),
+                    )),
                     tui::StackItem::spacing(1),
                 ])
             }
@@ -706,7 +642,7 @@ async fn tray_module(
                 ]));
 
                 match on_interact {
-                    Some(it) => elem.on_interact(it(*id)),
+                    Some(mk_interact) => elem.with_interact(mk_interact(*id)),
                     None => elem,
                 }
             }

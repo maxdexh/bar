@@ -5,7 +5,6 @@ use proc::{TermEvent, TermUpdate};
 use std::{collections::HashMap, ffi::OsString, sync::Arc, time::Duration};
 
 use anyhow::Context;
-use futures::Stream;
 use futures::StreamExt;
 use tokio::task::JoinSet;
 use tokio_util::{sync::CancellationToken, time::FutureExt as _};
@@ -23,13 +22,6 @@ const EDGE: &str = "top";
 const VERTICAL_PADDING: bool = true;
 const HORIZONTAL_PADDING: u16 = 4;
 
-#[derive(Clone, Debug)]
-pub struct OpenMenu {
-    pub monitor: Arc<str>,
-    pub tui: tui::Elem,
-    pub pix_location: tui::Vec2<u32>,
-    pub menu_kind: MenuKind,
-}
 #[derive(Debug, Clone, Copy)]
 pub enum MenuKind {
     Tooltip,
@@ -57,43 +49,26 @@ fn gather_bar_tui(bar_tui: &[BarTuiElem], monitor: &MonitorInfo) -> tui::Elem {
     tui::Stack::horizontal(parts).into()
 }
 
-pub async fn run_manager(
-    bar_rx: WatchRx<Vec<WatchRx<BarTuiElem>>>,
-    menu_rx: impl Stream<Item = OpenMenu>,
-    mut reload_tx: ReloadTx,
-) {
-    tokio::pin!(menu_rx);
-    let mut monitors = HashMap::<_, (_, CancelDropGuard)>::new();
+pub async fn run_manager(bar_rx: WatchRx<Vec<WatchRx<BarTuiElem>>>, mut reload_tx: ReloadTx) {
+    let mut monitors = HashMap::new();
 
     let mut monitor_rx = crate::monitors::connect();
 
-    loop {
-        tokio::select! {
-            Some(ev) = monitor_rx.next() => {
-                for monitor in ev.removed() {
-                    monitors.remove(monitor);
-                }
-                for monitor in ev.added_or_changed() {
-                    let cancel = CancellationToken::new();
-                    let (menu_tx, menu_rx) = unb_chan();
-                    tokio::spawn(run_monitor(
-                        monitor.clone(),
-                        cancel.clone(),
-                        bar_rx.clone(),
-                        menu_rx,
-                        reload_tx.clone(),
-                    ));
-                    monitors.insert(monitor.name.clone(), (menu_tx, cancel.into()));
-                }
-                reload_tx.reload();
-            }
-            Some(menu) = menu_rx.next() => {
-                let Some((menu_tx, _)) = monitors.get(&menu.monitor) else {
-                    continue;
-                };
-                menu_tx.send(menu).ok_or_log();
-            }
+    while let Some(ev) = monitor_rx.next().await {
+        for monitor in ev.removed() {
+            monitors.remove(monitor);
         }
+        for monitor in ev.added_or_changed() {
+            let cancel = CancellationToken::new();
+            tokio::spawn(run_monitor(
+                monitor.clone(),
+                cancel.clone(),
+                bar_rx.clone(),
+                reload_tx.clone(),
+            ));
+            monitors.insert(monitor.name.clone(), CancelDropGuard::from(cancel));
+        }
+        reload_tx.reload();
     }
 }
 
@@ -102,13 +77,11 @@ async fn run_monitor(
     monitor: MonitorInfo,
     cancel_monitor: CancellationToken,
     bar_rx: WatchRx<Vec<WatchRx<BarTuiElem>>>,
-    menu_rx: impl Stream<Item = OpenMenu>,
     mut reload_tx: ReloadTx,
 ) {
     log::debug!("Starting panel manager for monitor {monitor:?}");
 
     let _auto_cancel = CancelDropGuard::from(cancel_monitor.clone());
-    tokio::pin!(menu_rx);
 
     struct Term {
         term_ev_rx: UnbRx<TermEvent>,
@@ -125,7 +98,6 @@ async fn run_monitor(
         BarTui,
         MenuWatcherHide,
         Term(TermKind, TermEvent),
-        OpenMenu(OpenMenu),
     }
 
     let mut try_run = async || -> anyhow::Result<()> {
@@ -354,22 +326,22 @@ async fn run_monitor(
 
         #[derive(Debug)]
         struct ShowMenu {
-            tui: tui::Elem,
             kind: MenuKind,
-            location: tui::Vec2<u32>,
+            pix_location: tui::Vec2<u32>,
             cached_tui_size: tui::Vec2<u16>,
             sizing: tui::SizingArgs,
-            rendered: bool,
+            tui: tui::Elem,
         }
         let mut show_menu = None::<ShowMenu>;
+        let mut show_bar = Some(tui::Elem::empty());
         loop {
-            let mut resize_menu = false;
+            let mut rerender_menu = false;
+            let mut rerender_bar = false;
 
             let upd = tokio::select! {
                 Some(ev) = bar.term_ev_rx.next() => Upd::Term(TermKind::Bar, ev),
                 Some(ev) = menu.term_ev_rx.next() => Upd::Term(TermKind::Menu, ev),
                 Some(upd) = intern_upd_rx.next() => upd,
-                Some(menu) = menu_rx.next() => Upd::OpenMenu(menu),
                 Ok(()) = bar_tui_rx.changed() => Upd::BarTui,
                 Some(res) = subtasks.join_next() => match res {
                     Err(join_err) => {
@@ -384,111 +356,174 @@ async fn run_monitor(
             };
             match upd {
                 Upd::BarTui => {
-                    let tui = gather_bar_tui(&bar_tui_rx.borrow_and_update(), &monitor);
-                    let mut buf = Vec::new();
-                    let Some(layout) = tui::render(
-                        &tui,
-                        tui::Area {
-                            size: bar.sizes.cell_size,
-                            pos: Default::default(),
-                        },
-                        &mut buf,
-                        &tui::SizingArgs {
-                            font_size: bar.sizes.font_size(),
-                        },
-                    )
-                    .context("Failed to render bar")
-                    .ok_or_log() else {
-                        continue;
-                    };
-                    bar.layout = Some(layout);
-
-                    bar.term_upd_tx.send(TermUpdate::Print(buf)).ok_or_debug();
-                    bar.term_upd_tx.send(TermUpdate::Flush).ok_or_debug();
+                    if let Some(bar) = &mut show_bar {
+                        let tui = gather_bar_tui(&bar_tui_rx.borrow_and_update(), &monitor);
+                        *bar = tui;
+                        rerender_bar = true;
+                    }
                 }
                 Upd::Term(term_kind, ev) => match ev {
                     TermEvent::Crossterm(ev) => match ev {
                         crossterm::event::Event::Mouse(ev) => {
-                            if let Some((interact, callback)) = bar.layout.as_ref().and_then(|it| {
-                                it.interpret_mouse_event(
-                                    ev,
-                                    bar.sizes.font_size(),
-                                    monitor.name.clone(),
-                                )
-                            }) {
-                                if let Some(callback) = callback {
-                                    tokio::task::spawn_blocking(move || callback.call(interact));
-                                } else if matches!(term_kind, TermKind::Bar) {
-                                    let hide = match interact.kind {
-                                        tui::InteractKind::Hover => {
-                                            show_menu.as_ref().is_some_and(|it| match it.kind {
-                                                MenuKind::Tooltip => true,
-                                                MenuKind::Context => false,
-                                            })
-                                        }
-                                        tui::InteractKind::Click(..)
-                                        | tui::InteractKind::Scroll(..) => true,
-                                    };
-                                    if hide {
-                                        show_menu = None;
-                                        resize_menu = true;
+                            let Some(layout) = (match term_kind {
+                                TermKind::Menu => menu.layout.as_mut(),
+                                TermKind::Bar => bar.layout.as_mut(),
+                            }) else {
+                                continue;
+                            };
+                            let mut hide_menu = false;
+                            match (
+                                layout.interpret_mouse_event(ev, bar.sizes.font_size()),
+                                term_kind,
+                            ) {
+                                (tui::MouseEventResult::Ignore, _) => continue,
+                                (
+                                    res @ (tui::MouseEventResult::HoverChanged
+                                    | tui::MouseEventResult::HoverEmpty
+                                    | tui::MouseEventResult::HoverTooltip { .. }),
+                                    TermKind::Menu,
+                                ) => {
+                                    if matches!(res, tui::MouseEventResult::HoverTooltip { .. }) {
+                                        log::warn!(
+                                            "Ignoring tooltip, which is unsupported on menu"
+                                        );
+                                    }
+                                    rerender_menu = true;
+                                }
+                                (tui::MouseEventResult::HoverChanged, TermKind::Bar) => {
+                                    log::warn!("Hover without tooltip is unsupported on bar");
+                                }
+                                (tui::MouseEventResult::HoverEmpty, TermKind::Bar) => {
+                                    if show_menu
+                                        .as_ref()
+                                        .is_some_and(|it| matches!(it.kind, MenuKind::Tooltip))
+                                    {
+                                        hide_menu = true;
+                                    }
+                                    rerender_bar = true;
+                                }
+                                (
+                                    tui::MouseEventResult::Interact {
+                                        pix_location,
+                                        interact,
+                                        tooltip,
+                                    },
+                                    _,
+                                ) => {
+                                    if let Some((cb, args)) = interact
+                                        && let Some(tui) = cb.call(args)
+                                    {
+                                        let sizing = tui::SizingArgs {
+                                            font_size: menu.sizes.font_size(),
+                                        };
+                                        show_menu = Some(ShowMenu {
+                                            cached_tui_size: tui::calc_min_size(&tui, &sizing),
+                                            sizing,
+                                            tui,
+                                            kind: MenuKind::Context,
+                                            pix_location,
+                                        });
+                                        rerender_menu = true;
+                                    } else if let Some((tt, args)) = tooltip
+                                        && let Some(tui) = tt.call(args)
+                                    {
+                                        let sizing = tui::SizingArgs {
+                                            font_size: menu.sizes.font_size(),
+                                        };
+                                        show_menu = Some(ShowMenu {
+                                            cached_tui_size: tui::calc_min_size(&tui, &sizing),
+                                            sizing,
+                                            tui,
+                                            kind: MenuKind::Context,
+                                            pix_location,
+                                        });
+                                        rerender_menu = true;
+                                    } else if matches!(term_kind, TermKind::Bar) {
+                                        hide_menu = true;
                                     }
                                 }
+                                (tui::MouseEventResult::InteractEmpty, TermKind::Bar) => {
+                                    hide_menu = true;
+                                }
+                                (tui::MouseEventResult::InteractEmpty, TermKind::Menu) => {
+                                    continue;
+                                }
+                                (
+                                    tui::MouseEventResult::HoverTooltip {
+                                        pix_location,
+                                        tooltip,
+                                        args,
+                                    },
+                                    TermKind::Bar,
+                                ) => {
+                                    if show_menu
+                                        .as_ref()
+                                        .is_some_and(|it| matches!(it.kind, MenuKind::Context))
+                                    {
+                                        log::debug!("Not replacing context menu with tooltip");
+                                        continue;
+                                    }
+                                    let Some(tui) = tooltip.call(args) else {
+                                        continue;
+                                    };
+                                    let sizing = tui::SizingArgs {
+                                        font_size: menu.sizes.font_size(),
+                                    };
+                                    show_menu = Some(ShowMenu {
+                                        cached_tui_size: tui::calc_min_size(&tui, &sizing),
+                                        sizing,
+                                        tui,
+                                        kind: MenuKind::Tooltip,
+                                        pix_location,
+                                    });
+                                    rerender_menu = true;
+                                }
+                            }
+                            if hide_menu && show_menu.is_some() {
+                                show_menu = None;
+                                rerender_menu = true;
                             }
                         }
                         _ => {
                             //
                         }
                     },
+                    // FIXME: Rerender on font size change
                     TermEvent::Sizes(sizes) => match term_kind {
                         TermKind::Bar => {
                             bar.sizes = sizes;
                             reload_tx.reload();
                         }
                         TermKind::Menu => {
-                            if menu.sizes.font_size() != sizes.font_size()
-                                && let Some(show) = &mut show_menu
-                            {
-                                show.rendered = false;
-                                menu.sizes = sizes;
-                            } else {
-                                menu.sizes = sizes;
-                            }
+                            menu.sizes = sizes;
                         }
                     },
                 },
-                Upd::OpenMenu(OpenMenu {
-                    tui,
-                    pix_location: location,
-                    menu_kind,
-                    monitor: _,
-                }) => {
-                    let sizing = tui::SizingArgs {
-                        font_size: menu.sizes.font_size(),
-                    };
-                    show_menu = Some(ShowMenu {
-                        cached_tui_size: tui::calc_min_size(&tui, &sizing),
-                        sizing,
-                        tui,
-                        kind: menu_kind,
-                        location,
-                        rendered: false,
-                    });
-                    resize_menu = true;
-                }
                 Upd::MenuWatcherHide => {
                     show_menu = None;
+                    if let Some(layout) = &mut bar.layout
+                        && layout.reset_hover()
+                    {
+                        rerender_bar = true;
+                    }
                 }
             }
 
-            if resize_menu {
+            if rerender_menu {
+                if show_menu.is_none()
+                    && let Some(layout) = &mut bar.layout
+                    && layout.reset_hover()
+                {
+                    rerender_bar = true;
+                }
+
                 if let Some(ShowMenu {
-                    location,
+                    pix_location: location,
                     cached_tui_size,
-                    rendered: false,
-                    ..
+                    ref tui,
+                    ref sizing,
+                    kind: _,
                 }) = show_menu
-                    && cached_tui_size != menu.sizes.cell_size
                 {
                     // HACK: This minimizes the rounding error for some reason (as far as I can tell).
                     let scale = (monitor.scale * 1000.0).ceil() / 1000.0;
@@ -541,53 +576,66 @@ async fn run_monitor(
                             format!("lines={lines}").into(),
                         ]))
                         .ok_or_log();
+
+                    let mut buf = Vec::new();
+
+                    // NOTE: The terminal might not be done resizing at this point,
+                    // which would cause issues if passing the terminal's size here.
+                    // Passing the tui's desired size sidesteps this because kitty
+                    // will rerender it correctly once the resize is done.
+                    if let Some(layout) = tui::render(
+                        tui,
+                        tui::Area {
+                            size: cached_tui_size,
+                            pos: tui::Vec2 {
+                                x: HORIZONTAL_PADDING / 2,
+                                y: 0,
+                            },
+                        },
+                        &mut buf,
+                        sizing,
+                        menu.layout.as_ref(),
+                    )
+                    .context("Failed to draw menu")
+                    .ok_or_log()
+                    {
+                        menu.layout = Some(layout);
+                        menu.term_upd_tx.send(TermUpdate::Print(buf)).ok_or_log();
+                        menu.term_upd_tx.send(TermUpdate::Flush).ok_or_log();
+                    }
                 }
 
-                // TODO: be smarter about when to run this
                 let action = if show_menu.is_some() { "show" } else { "hide" };
                 menu.term_upd_tx
                     .send(TermUpdate::RemoteControl(vec![
                         "resize-os-window".into(),
                         format!("--action={}", action).into(),
                     ]))
-                    .ok_or_log();
+                    .ok_or_debug();
             }
 
-            if let Some(ShowMenu {
-                ref mut tui,
-                rendered: ref mut rendered @ false,
-                cached_tui_size,
-                ref sizing,
-                ..
-            }) = show_menu
-            {
-                *rendered = true;
-
+            if rerender_bar && let Some(tui) = &show_bar {
                 let mut buf = Vec::new();
-
-                // NOTE: The terminal might not be done resizing at this point,
-                // which would cause issues if passing the terminal's size here.
-                // Passing the tui's desired size sidesteps this because kitty
-                // will rerender it correctly once the resize is done.
-                if let Some(layout) = tui::render(
+                let Some(layout) = tui::render(
                     tui,
                     tui::Area {
-                        size: cached_tui_size,
-                        pos: tui::Vec2 {
-                            x: HORIZONTAL_PADDING / 2,
-                            y: 0,
-                        },
+                        size: bar.sizes.cell_size,
+                        pos: Default::default(),
                     },
                     &mut buf,
-                    sizing,
+                    &tui::SizingArgs {
+                        font_size: bar.sizes.font_size(),
+                    },
+                    bar.layout.as_ref(),
                 )
-                .context("Failed to draw menu")
-                .ok_or_log()
-                {
-                    menu.layout = Some(layout);
-                    menu.term_upd_tx.send(TermUpdate::Print(buf)).ok_or_log();
-                    menu.term_upd_tx.send(TermUpdate::Flush).ok_or_log();
-                }
+                .context("Failed to render bar")
+                .ok_or_log() else {
+                    continue;
+                };
+                bar.layout = Some(layout);
+
+                bar.term_upd_tx.send(TermUpdate::Print(buf)).ok_or_debug();
+                bar.term_upd_tx.send(TermUpdate::Flush).ok_or_debug();
             }
         }
     };

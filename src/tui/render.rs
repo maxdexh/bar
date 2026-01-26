@@ -26,13 +26,29 @@ pub fn render(
     area: Area,
     writer: &mut impl Write,
     sizing: &SizingArgs,
+    old_layout: Option<&RenderedLayout>,
 ) -> std::io::Result<RenderedLayout> {
     crossterm::queue!(
         writer,
         crossterm::terminal::BeginSynchronizedUpdate,
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
     )?;
-    let mut layout = RenderedLayout::new();
+    let mut layout = old_layout.map_or_else(
+        || RenderedLayout {
+            widgets: Default::default(),
+            last_hover: None,
+            last_hover_id: None,
+        },
+        |&RenderedLayout {
+             widgets: _,
+             last_hover,
+             last_hover_id,
+         }| RenderedLayout {
+            widgets: Default::default(),
+            last_hover,
+            last_hover_id,
+        },
+    );
     elem.render(
         &mut RenderCtx {
             sizing,
@@ -47,9 +63,7 @@ pub fn render(
 
 impl Render for Elem {
     fn render(&self, ctx: &mut RenderCtx<impl Write>, area: Area) -> std::io::Result<()> {
-        if let Some(callback) = self.on_interact.clone() {
-            ctx.layout.insert(area, callback);
-        }
+        ctx.layout.insert(area, self);
         self.kind.render(ctx, area)
     }
     fn calc_min_size(&self, args: &SizingArgs) -> Vec2<u16> {
@@ -283,9 +297,6 @@ impl Render for Block {
         } = self.borders;
 
         if let Some(inner) = &self.inner {
-            let min_size = self.calc_min_size(ctx.sizing);
-            log::debug!("{min_size:?} {area:?}");
-
             inner.render(
                 ctx,
                 Area {

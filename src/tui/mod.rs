@@ -19,7 +19,11 @@ enum ElemKind {
 #[derive(Default, Debug, Clone)]
 pub struct Elem {
     kind: ElemKind,
-    on_interact: Option<InteractCallback>,
+
+    hover_id: Option<u64>,
+    interact: Option<InteractCallback>,
+    tooltip: Option<HoverCallback>,
+    hovered: Option<Arc<Elem>>,
 }
 impl Elem {
     pub fn empty() -> Self {
@@ -29,8 +33,25 @@ impl Elem {
         }
     }
 
-    pub fn on_interact(mut self, callback: InteractCallback) -> Self {
-        self.on_interact = Some(callback);
+    fn assign_hover_id(&mut self) {
+        if self.hover_id.is_none() {
+            use std::sync::atomic::*;
+            static HOVER_ID: AtomicU64 = AtomicU64::new(0);
+            self.hover_id = Some(HOVER_ID.fetch_add(1, Ordering::Relaxed));
+        }
+    }
+    pub fn with_interact(mut self, on_interact: impl Into<InteractCallback>) -> Self {
+        self.interact = Some(on_interact.into());
+        self
+    }
+    pub fn with_tooltip(mut self, tooltip: impl Into<HoverCallback>) -> Self {
+        self.assign_hover_id();
+        self.tooltip = Some(tooltip.into());
+        self
+    }
+    pub fn with_hovered(mut self, hovered: impl Into<Elem>) -> Self {
+        self.assign_hover_id();
+        self.hovered = Some(Arc::new(hovered.into()));
         self
     }
 }
@@ -223,11 +244,20 @@ impl<T, R> Callback<T, R> {
         (self.cb)(arg)
     }
 }
-pub type InteractCallback = Callback<InteractData, ()>;
+impl<T, R> From<&Callback<T, R>> for Callback<T, R> {
+    fn from(value: &Callback<T, R>) -> Self {
+        value.clone()
+    }
+}
+pub type InteractCallback = Callback<InteractArgs, Option<Elem>>;
+pub type HoverCallback = Callback<HoverArgs, Option<Elem>>;
+#[derive(Debug)]
+pub struct HoverArgs {
+    _p: (),
+}
 
-pub struct InteractData {
-    pub pix_location: Vec2<u32>,
-    pub monitor: Arc<str>,
+#[derive(Debug)]
+pub struct InteractArgs {
     pub kind: InteractKind,
     _p: (),
 }

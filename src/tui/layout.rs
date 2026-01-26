@@ -67,26 +67,50 @@ impl Axis {
 
 #[derive(Debug)]
 pub struct RenderedLayout {
-    widgets: Vec<(Area, InteractCallback)>,
+    pub(super) widgets: Vec<(Area, Elem)>,
+    pub(super) last_hover: Option<Vec2<u16>>,
+    pub(super) last_hover_id: Option<u64>,
+}
+
+#[derive(Debug)]
+pub enum MouseEventResult {
+    Ignore,
+    HoverChanged,
+    HoverEmpty,
+    Interact {
+        pix_location: Vec2<u32>,
+        interact: Option<(InteractCallback, InteractArgs)>,
+        tooltip: Option<(HoverCallback, HoverArgs)>,
+    },
+    InteractEmpty,
+    HoverTooltip {
+        pix_location: Vec2<u32>,
+        tooltip: HoverCallback,
+        args: HoverArgs,
+    },
 }
 
 impl RenderedLayout {
-    pub fn new() -> Self {
-        Self {
-            widgets: Default::default(),
+    pub fn insert(&mut self, area: Area, elem: &Elem) {
+        if elem.hovered.is_some() || elem.tooltip.is_some() || elem.interact.is_some() {
+            self.widgets.push((area, elem.clone()))
         }
     }
-    pub fn insert(&mut self, rect: Area, widget: InteractCallback) {
-        self.widgets.push((rect, widget));
+
+    pub fn reset_hover(&mut self) -> bool {
+        let changed = self.last_hover_id.is_some();
+        self.last_hover = None;
+        self.last_hover_id = None;
+        changed
     }
 
     // FIXME: Find smallest area that contains location
     pub fn interpret_mouse_event(
-        &self,
+        &mut self,
         event: crossterm::event::MouseEvent,
         font_size: Vec2<u16>,
-        monitor: Arc<str>,
-    ) -> Option<(InteractData, Option<InteractCallback>)> {
+    ) -> MouseEventResult {
+        log::debug!("{event:?} {self:?}");
         use crossterm::event::*;
 
         let MouseEvent {
@@ -97,7 +121,7 @@ impl RenderedLayout {
         } = event;
         let pos = Vec2 { x: column, y: row };
 
-        let (area, cb) = self
+        let (area, elem) = self
             .widgets
             .iter()
             .find(|(r, _)| r.contains(pos))
@@ -117,19 +141,8 @@ impl RenderedLayout {
         type DR = Direction;
         type IK = InteractKind;
         type MK = crossterm::event::MouseEventKind;
-        let kind = match kind {
-            MK::Down(button) => IK::Click(button.into()),
-            MK::Moved => IK::Hover,
-            MK::ScrollDown => IK::Scroll(DR::Down),
-            MK::ScrollUp => IK::Scroll(DR::Up),
-            MK::ScrollLeft => IK::Scroll(DR::Left),
-            MK::ScrollRight => IK::Scroll(DR::Right),
-            MK::Up(_) | MK::Drag(_) => {
-                return None;
-            }
-        };
 
-        let location = {
+        let pix_location = {
             let font_w = u32::from(font_size.x);
             let font_h = u32::from(font_size.y);
             Vec2 {
@@ -138,15 +151,58 @@ impl RenderedLayout {
             }
         };
 
-        Some((
-            InteractData {
-                pix_location: location,
-                monitor,
-                kind,
-                _p: (),
-            },
-            cb.cloned(),
-        ))
+        if let MK::Moved = kind {
+            self.last_hover = Some(pos);
+            let Some(Elem {
+                hover_id: Some(hover_id),
+                tooltip,
+                ..
+            }) = elem
+            else {
+                return if self.last_hover_id.take().is_some() {
+                    MouseEventResult::HoverEmpty
+                } else {
+                    MouseEventResult::Ignore
+                };
+            };
+            if self.last_hover_id.replace(*hover_id) == Some(*hover_id) {
+                return MouseEventResult::Ignore;
+            }
+            let Some(tt) = tooltip else {
+                return MouseEventResult::HoverChanged;
+            };
+            MouseEventResult::HoverTooltip {
+                pix_location,
+                tooltip: tt.clone(),
+                args: HoverArgs { _p: () },
+            }
+        } else {
+            let kind = match kind {
+                MK::Moved => unreachable!(),
+                MK::Down(button) => IK::Click(button.into()),
+                MK::ScrollDown => IK::Scroll(DR::Down),
+                MK::ScrollUp => IK::Scroll(DR::Up),
+                MK::ScrollLeft => IK::Scroll(DR::Left),
+                MK::ScrollRight => IK::Scroll(DR::Right),
+                MK::Up(_) | MK::Drag(_) => {
+                    return MouseEventResult::Ignore;
+                }
+            };
+            let Some(elem) = elem else {
+                return MouseEventResult::InteractEmpty;
+            };
+            MouseEventResult::Interact {
+                pix_location,
+                interact: elem
+                    .interact
+                    .as_ref()
+                    .map(|cb| (cb.clone(), InteractArgs { kind, _p: () })),
+                tooltip: elem
+                    .tooltip
+                    .as_ref()
+                    .map(|tt| (tt.clone(), HoverArgs { _p: () })),
+            }
+        }
     }
 }
 
@@ -168,7 +224,6 @@ impl From<crossterm::event::MouseButton> for MouseButton {
 }
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum InteractKind {
-    Hover,
     Click(MouseButton),
     Scroll(Direction),
 }
