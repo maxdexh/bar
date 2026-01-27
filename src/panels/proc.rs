@@ -1,6 +1,5 @@
 use std::{
     ffi::{OsStr, OsString},
-    sync::atomic::AtomicU64,
     time::Duration,
 };
 
@@ -16,8 +15,8 @@ use crate::{
 };
 
 const SOCK_PATH_VAR: &str = "BAR_TERM_INSTANCE_SOCK_PATH";
-pub const PANEL_PROC_ARG: &str = "internal-managed-terminal";
-pub const PROC_LOG_NAME_VAR: &str = "BAR_TERM_INSTANCE";
+pub const PANEL_PROC_ARG: &str = "--internal-managed-terminal";
+pub const PROC_LOG_NAME_VAR: &str = "BAR_TERM_INSTANCE_NAME";
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum TermUpdate {
@@ -33,11 +32,6 @@ pub enum TermEvent {
     Sizes(tui::Sizes),
 }
 
-fn get_log_inst_counter() -> u64 {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
 pub fn spawn_generic_panel<AK: AsRef<OsStr>, AV: AsRef<OsStr>>(
     log_name: &str,
     upd_rx: impl Stream<Item = TermUpdate> + 'static + Send,
@@ -48,6 +42,7 @@ pub fn spawn_generic_panel<AK: AsRef<OsStr>, AV: AsRef<OsStr>>(
 ) -> anyhow::Result<()> {
     // FIXME: delete immediately after establishing connection
     let tmpdir = tempfile::TempDir::new()?;
+
     let sock_path = tmpdir.path().join("term-updates.sock");
     let socket = tokio::net::UnixListener::bind(&sock_path)?;
     let mut child = tokio::process::Command::new("kitten")
@@ -57,10 +52,7 @@ pub fn spawn_generic_panel<AK: AsRef<OsStr>, AV: AsRef<OsStr>>(
         .arg(PANEL_PROC_ARG)
         .envs(extra_envs)
         .env(SOCK_PATH_VAR, sock_path)
-        .env(
-            PROC_LOG_NAME_VAR,
-            format!("(T{}){log_name}", get_log_inst_counter()),
-        )
+        .env(PROC_LOG_NAME_VAR, log_name)
         .kill_on_drop(true)
         .stdout(std::io::stderr())
         .spawn()?;
@@ -152,8 +144,11 @@ async fn run_term_inst_mgr(
     Ok(())
 }
 
-pub async fn term_proc_main() {
-    term_proc_main_inner().await.ok_or_log();
+pub async fn term_proc_main() -> std::process::ExitCode {
+    match term_proc_main_inner().await.ok_or_log() {
+        Some(()) => std::process::ExitCode::SUCCESS,
+        None => std::process::ExitCode::FAILURE,
+    }
 }
 
 async fn term_proc_main_inner() -> anyhow::Result<()> {

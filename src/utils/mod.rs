@@ -10,15 +10,14 @@ pub use dbg::*;
 
 pub trait ResultExt {
     type Ok;
-    #[track_caller]
     fn ok_or_log(self) -> Option<Self::Ok>;
-
-    #[track_caller]
     fn ok_or_debug(self) -> Option<Self::Ok>;
 }
+
 impl<T, E: Into<anyhow::Error>> ResultExt for Result<T, E> {
     type Ok = T;
     #[track_caller]
+    #[inline]
     fn ok_or_log(self) -> Option<T> {
         match self {
             Ok(val) => Some(val),
@@ -30,6 +29,7 @@ impl<T, E: Into<anyhow::Error>> ResultExt for Result<T, E> {
     }
 
     #[track_caller]
+    #[inline]
     fn ok_or_debug(self) -> Option<T> {
         match self {
             Ok(val) => Some(val),

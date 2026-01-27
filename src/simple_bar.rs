@@ -47,7 +47,7 @@ impl BarModuleFactory {
     }
 }
 
-pub async fn main2() {
+pub async fn main() -> std::process::ExitCode {
     let mut tasks = JoinSet::new();
     let mut reload_tx = ReloadTx::new();
 
@@ -100,7 +100,12 @@ pub async fn main2() {
     reload_tx.reload();
 
     if let Some(res) = tasks.join_next().await {
-        res.ok_or_log();
+        match res.ok_or_log() {
+            Some(_) => std::process::ExitCode::SUCCESS,
+            None => std::process::ExitCode::FAILURE,
+        }
+    } else {
+        unreachable!()
     }
 }
 
