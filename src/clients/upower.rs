@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::Context as _;
+use futures::StreamExt as _;
 use tokio_util::task::AbortOnDropHandle;
 use zbus::proxy;
 
@@ -175,61 +176,64 @@ async fn try_run_bg(
     reload_rx: &mut ReloadRx,
 ) -> anyhow::Result<()> {
     let dbus = zbus::Connection::system().await?;
+
     let upower = UPowerProxy::<'static>::new(&dbus).await?;
 
-    let device = upower.get_display_device().await?;
-    let device_proxy = device.inner();
+    let device_proxy = upower.get_display_device().await?.into_inner();
+
     let properties = zbus::fdo::PropertiesProxy::builder(&dbus)
         .destination(device_proxy.destination())?
         .path(device_proxy.path())?
         .build()
         .await?;
 
-    let prop_change_rx = device_proxy.receive_all_signals().await?;
+    let device_interface = device_proxy.interface().to_owned();
 
-    let main_fut = futures::StreamExt::for_each_concurrent(prop_change_rx, 10, async |msg| {
-        let header = msg.header();
-        let Some(member) = header.member() else {
-            return;
-        };
+    let _reload_task = AbortOnDropHandle::new({
+        let state_tx = state_tx.clone();
+        let properties = properties.clone();
+        let mut reload_rx = reload_rx.clone();
+        let device_interface = device_interface.clone();
 
-        let Some(value) = properties
-            .get(device_proxy.interface().clone(), member)
-            .await
-            .ok_or_log()
-        else {
-            return;
-        };
-
-        state_tx.send_if_modified(|state| state.update(member, value).ok_or_log().unwrap_or(false));
+        tokio::spawn(async move {
+            while let Some(()) = reload_rx.wait().await {
+                let Some(props) = properties
+                    .get_all(device_interface.clone())
+                    .await
+                    .ok_or_log()
+                else {
+                    continue;
+                };
+                state_tx.send_modify(|state| {
+                    for (member, value) in props {
+                        state
+                            .update(&member, value)
+                            .context("Failed to update upower energy state")
+                            .ok_or_log();
+                    }
+                });
+            }
+        })
     });
 
-    let reload_fut = async {
-        while let Some(()) = reload_rx.wait().await {
-            let Some(props) = properties
-                .get_all(device_proxy.interface().clone())
-                .await
-                .ok_or_log()
-            else {
-                continue;
+    let mut prop_change_rx = device_proxy.receive_all_signals().await?;
+    while let Some(msg) = prop_change_rx.next().await {
+        let state_tx = state_tx.clone();
+        let device_interface = device_interface.clone();
+        let properties = properties.clone();
+        tokio::spawn(async move {
+            let header = msg.header();
+            let Some(member) = header.member() else {
+                return;
             };
-            state_tx.send_modify(|state| {
-                for (member, value) in props {
-                    state
-                        .update(&member, value)
-                        .context("Failed to update upower energy state")
-                        .ok_or_log();
-                }
-            });
-        }
-    };
 
-    tokio::select! {
-        () = main_fut => {}
-        () = async {
-            reload_fut.await;
-            std::future::pending().await
-        } => {}
+            let Some(value) = properties.get(device_interface, member).await.ok_or_log() else {
+                return;
+            };
+
+            state_tx
+                .send_if_modified(|state| state.update(member, value).ok_or_log().unwrap_or(false));
+        });
     }
 
     Ok(())

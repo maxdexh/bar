@@ -1,5 +1,6 @@
 use std::{
     ffi::{OsStr, OsString},
+    path::Path,
     time::Duration,
 };
 
@@ -32,19 +33,17 @@ pub enum TermEvent {
     Sizes(tui::Sizes),
 }
 
-pub fn spawn_generic_panel<AK: AsRef<OsStr>, AV: AsRef<OsStr>>(
+pub async fn start_generic_panel(
+    sock_path: &Path,
     log_name: &str,
     upd_rx: impl Stream<Item = TermUpdate> + 'static + Send,
     extra_args: impl IntoIterator<Item: AsRef<OsStr>>,
-    extra_envs: impl IntoIterator<Item = (AK, AV)>,
+    extra_envs: impl IntoIterator<Item = (OsString, OsString)>,
     term_ev_tx: UnbTx<TermEvent>,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
-    // FIXME: delete immediately after establishing connection
-    let tmpdir = tempfile::TempDir::new()?;
+    let socket = tokio::net::UnixListener::bind(sock_path)?;
 
-    let sock_path = tmpdir.path().join("term-updates.sock");
-    let socket = tokio::net::UnixListener::bind(&sock_path)?;
     let mut child = tokio::process::Command::new("kitten")
         .arg("panel")
         .args(extra_args)
@@ -55,9 +54,14 @@ pub fn spawn_generic_panel<AK: AsRef<OsStr>, AV: AsRef<OsStr>>(
         .env(PROC_LOG_NAME_VAR, log_name)
         .kill_on_drop(true)
         .stdout(std::io::stderr())
-        .spawn()?;
+        .spawn()
+        .context("Failed to spawn terminal")?;
 
-    // FIXME: Spawn in a joinset
+    let (socket, _) = socket
+        .accept()
+        .await
+        .context("Failed to accept socket connection")?;
+
     tokio::spawn(async move {
         let mut mgr = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(run_term_inst_mgr(
             socket,
@@ -78,7 +82,6 @@ pub fn spawn_generic_panel<AK: AsRef<OsStr>, AV: AsRef<OsStr>>(
         };
         cancel.cancel();
         drop(mgr);
-        drop(tmpdir);
 
         // Child should exit by itself because the socket connection is closed.
         let child_res = child.wait().timeout(Duration::from_secs(10)).await;
@@ -105,7 +108,7 @@ pub fn spawn_generic_panel<AK: AsRef<OsStr>, AV: AsRef<OsStr>>(
     Ok(())
 }
 async fn run_term_inst_mgr(
-    socket: tokio::net::UnixListener,
+    connection: tokio::net::UnixStream,
     ev_tx: UnbTx<TermEvent>,
     updates: impl Stream<Item = TermUpdate> + Send + 'static,
     cancel: CancellationToken,
@@ -114,13 +117,7 @@ async fn run_term_inst_mgr(
     let mut tasks = JoinSet::<()>::new();
     // TODO: Await stream
 
-    let (socket, _) = socket
-        .accept()
-        .timeout(Duration::from_secs(5))
-        .await
-        .context("Timed out while accepting socket connection")?
-        .context("Failed to accept socket connection")?;
-    let (read_half, write_half) = socket.into_split();
+    let (read_half, write_half) = connection.into_split();
 
     tasks.spawn(read_cobs_sock::<TermEvent>(
         read_half,

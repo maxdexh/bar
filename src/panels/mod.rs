@@ -473,6 +473,47 @@ async fn run_monitor_mainloop(
     }
 }
 
+async fn init_term(
+    sock_path: std::path::PathBuf,
+    log_name: String,
+    extra_args: impl IntoIterator<Item = OsString>,
+    extra_envs: impl IntoIterator<Item = (OsString, OsString)>,
+    cancel: &CancellationToken,
+) -> anyhow::Result<Term> {
+    let (term_upd_tx, term_upd_rx) = unb_chan();
+    let (term_ev_tx, mut term_ev_rx) = unb_chan();
+
+    proc::start_generic_panel(
+        &sock_path,
+        &log_name,
+        term_upd_rx,
+        extra_args,
+        extra_envs,
+        term_ev_tx,
+        cancel.clone(),
+    )
+    .await?;
+
+    let sizes = loop {
+        match term_ev_rx.next().await {
+            Some(TermEvent::Sizes(sizes)) => break sizes,
+            Some(ev) => {
+                log::error!("Ignoring term event {ev:?}. The first event should be _::Sizes");
+            }
+            None => {
+                anyhow::bail!("Failure receiving initial size event from terminal (channel closed)")
+            }
+        }
+    };
+
+    anyhow::Ok(Term {
+        sizes,
+        layout: Default::default(),
+        term_ev_rx,
+        term_upd_tx,
+    })
+}
+
 async fn try_init_monitor(
     monitor: &MonitorInfo,
     bar_rx: &WatchRx<Vec<WatchRx<BarTuiElem>>>,
@@ -481,56 +522,12 @@ async fn try_init_monitor(
 ) -> anyhow::Result<StartedMonitorEnv> {
     let (intern_upd_tx, intern_upd_rx) = unb_chan();
 
-    let init_term = async |log_name: String, args, envs| {
-        let (term_upd_tx, term_upd_rx) = unb_chan();
-        let (term_ev_tx, mut term_ev_rx) = unb_chan();
-
-        proc::spawn_generic_panel(
-            &log_name,
-            term_upd_rx,
-            args,
-            envs,
-            term_ev_tx,
-            cancel.clone(),
-        )?;
-
-        let sizes = loop {
-            match term_ev_rx.next().await {
-                Some(TermEvent::Sizes(sizes)) => break sizes,
-                Some(ev) => {
-                    log::error!("Ignoring term event {ev:?}. The first event should be _::Sizes");
-                }
-                None => anyhow::bail!(
-                    "Failure receiving initial size event from terminal (channel closed)"
-                ),
-            }
-        };
-
-        anyhow::Ok(Term {
-            sizes,
-            layout: Default::default(),
-            term_ev_rx,
-            term_upd_tx,
-        })
-    };
-
-    let (watcher_tmpdir, watcher_py, watcher_sock_path, watcher_sock) =
-        tokio::task::spawn_blocking(|| {
-            let tmpdir = TempDir::new()?;
-            let watcher_py = tmpdir.path().join("menu_watcher.py");
-            std::fs::write(&watcher_py, include_bytes!("menu_watcher.py"))?;
-
-            let sock_path = tmpdir.path().join("menu_watcher.sock");
-            let sock = tokio::net::UnixListener::bind(&sock_path)?;
-            Ok((tmpdir, watcher_py, sock_path, sock))
-        })
-        .await
-        .map_err(anyhow::Error::from)
-        .flatten()?;
+    let tmpdir = tokio::task::spawn_blocking(TempDir::new).await??;
 
     let bar_fut = init_term(
+        tmpdir.path().join("bar-term-socket.sock"),
         format!("BAR@{}", monitor.name),
-        vec![
+        [
             format!("--output-name={}", monitor.name).into(),
             // Allow logging to $KITTY_STDIO_FORWARDED
             "-o=forward_stdio=yes".into(),
@@ -544,13 +541,22 @@ async fn try_init_monitor(
             // disable hiding the mouse
             "-o=mouse_hide_wait=0".into(),
         ],
-        vec![],
+        [],
+        cancel,
     );
 
     let menu_fut = async {
+        let watcher_py = tmpdir.path().join("menu_watcher.py");
+
+        tokio::fs::write(&watcher_py, include_bytes!("menu_watcher.py")).await?;
+
+        let watcher_sock_path = tmpdir.path().join("menu_watcher.sock");
+        let watcher_sock = tokio::net::UnixListener::bind(&watcher_sock_path)?;
+
         let menu = init_term(
+            tmpdir.path().join("menu-term-socket.sock"),
             format!("MENU@{}", monitor.name),
-            vec![
+            [
                 {
                     let mut arg = OsString::from("-o=watcher=");
                     arg.push(watcher_py);
@@ -597,7 +603,8 @@ async fn try_init_monitor(
                 "-o=resize_debounce_time=0 0".into(),
                 // TODO: Mess with repaint_delay, input_delay
             ],
-            vec![("BAR_MENU_WATCHER_SOCK", watcher_sock_path)],
+            [("BAR_MENU_WATCHER_SOCK".into(), watcher_sock_path.into())],
+            cancel,
         )
         .await?;
         menu.term_upd_tx
@@ -624,12 +631,14 @@ async fn try_init_monitor(
         anyhow::Ok((menu, s))
     };
 
-    let (bar, (menu, mut watcher_stream)) = async { tokio::try_join!(bar_fut, menu_fut) }
+    let res = async { tokio::try_join!(bar_fut, menu_fut) }
         .timeout(Duration::from_secs(10))
-        .await??;
+        .await;
 
-    // We have connected to the watcher, there is no need to keep the socket file around.
-    drop(watcher_tmpdir);
+    // We have connected to the sockets, there is no need to keep the files around.
+    tokio::task::spawn_blocking(move || drop(tmpdir));
+
+    let (bar, (menu, mut watcher_stream)) = res??;
 
     required_tasks.spawn({
         let upd_tx = intern_upd_tx.clone();

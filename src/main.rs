@@ -53,6 +53,7 @@ fn main() -> std::process::ExitCode {
             .await
             .context("Failed to receive any signals")
             .map(|kind| {
+                log::debug!("Received exit signal {kind:?}");
                 let code = 128 + kind.as_raw_value();
                 std::process::ExitCode::from(code as u8)
             })
