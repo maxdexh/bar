@@ -44,13 +44,10 @@ fn format_log(
         });
     static FORMAT: LazyLock<Format> = LazyLock::new(|| Format {
         pid: std::process::id(),
-        color: {
-            let color = std::env::var(COLOR_VAR);
-            match color.as_deref().unwrap_or("auto") {
-                "never" | "no" | "off" | "false" => false,
-                "always" | "yes" | "on" | "true" => true,
-                _ => std::io::IsTerminal::is_terminal(&std::io::stderr()),
-            }
+        color: match std::env::var(COLOR_VAR).as_deref().unwrap_or("auto") {
+            "never" | "no" | "off" | "false" => false,
+            "always" | "yes" | "on" | "true" => true,
+            _ => std::io::IsTerminal::is_terminal(&std::io::stderr()),
         },
         proc_name: PROC_NAME.as_deref().unwrap_or("UNKNOWN").to_owned(),
     });

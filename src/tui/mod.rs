@@ -27,6 +27,8 @@ pub struct Elem {
     tooltip: Option<HoverCallback>,
     hovered: Option<Arc<Elem>>,
 }
+
+// FIXME: Implement hover replacements, clarify nested interactive elements.
 impl Elem {
     pub fn empty() -> Self {
         Self {
@@ -53,8 +55,7 @@ impl Elem {
     }
     pub fn with_hovered(mut self, hovered: impl Into<Elem>) -> Self {
         self.assign_hover_id();
-        let mut hovered = hovered.into();
-        hovered.hover_id = self.hover_id;
+        let hovered = hovered.into();
         self.hovered = Some(Arc::new(hovered));
         self
     }
