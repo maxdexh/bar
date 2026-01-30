@@ -5,7 +5,7 @@ use futures::StreamExt as _;
 use tokio_util::task::AbortOnDropHandle;
 use zbus::proxy;
 
-use crate::utils::{ReloadRx, ResultExt, WatchRx, WatchTx, run_or_retry, watch_chan};
+use bar_common::utils::{ReloadRx, ResultExt, WatchRx, WatchTx, run_or_retry, watch_chan};
 
 macro_rules! declare_properties {
     (

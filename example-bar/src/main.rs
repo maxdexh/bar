@@ -1,17 +1,15 @@
 mod clients;
-mod data;
-mod logging;
-mod monitors;
-mod panels;
-mod simple_bar;
-mod tui;
-mod utils;
+mod desktop;
+mod runner;
 
 fn main() -> std::process::ExitCode {
-    use crate::{logging::ProcKind, utils::ResultExt as _};
     use anyhow::Context as _;
+    use bar_common::utils::ResultExt as _;
 
-    crate::logging::init_logger();
+    bar_common::logging::init_logger(
+        bar_common::logging::ProcKind::Controller,
+        "CONTROLLER".into(),
+    );
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -67,11 +65,7 @@ fn main() -> std::process::ExitCode {
             .flatten()
     };
 
-    let main_task =
-        tokio_util::task::AbortOnDropHandle::new(match crate::logging::proc_kind_from_args() {
-            ProcKind::Panel => runtime.spawn(crate::panels::proc::term_proc_main()),
-            ProcKind::Controller => runtime.spawn(crate::simple_bar::main()),
-        });
+    let main_task = runtime.spawn(runner::main());
 
     runtime.block_on(async move {
         tokio::select! {

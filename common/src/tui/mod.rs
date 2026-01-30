@@ -231,8 +231,8 @@ impl<S> PlainLines<S> {
 
 #[derive(Debug)]
 pub struct OpenMenu {
-    pub(crate) tui: Elem,
-    pub(crate) menu_kind: MenuKind,
+    pub tui: Elem,
+    pub menu_kind: MenuKind,
 }
 impl OpenMenu {
     pub fn context(tui: Elem) -> Self {
@@ -257,9 +257,9 @@ pub enum MenuKind {
 pub type InteractCallback = Callback<InteractArgs, Option<OpenMenu>>;
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct InteractArgs {
     pub kind: InteractKind,
-    _p: (),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -414,7 +414,6 @@ impl LineSet {
         }
     }
 
-    #[expect(dead_code)]
     pub fn rounded() -> Self {
         Self {
             top_right: lazy_str!("╮"),
@@ -425,7 +424,6 @@ impl LineSet {
         }
     }
 
-    #[expect(dead_code)]
     pub fn double() -> Self {
         Self {
             vertical: lazy_str!("║"),
@@ -448,7 +446,6 @@ impl LineSet {
         }
     }
 
-    #[expect(dead_code)]
     pub fn light_double_dashed() -> Self {
         Self {
             vertical: lazy_str!("╎"),
@@ -457,7 +454,6 @@ impl LineSet {
         }
     }
 
-    #[expect(dead_code)]
     pub fn heavy_double_dashed() -> Self {
         Self {
             vertical: lazy_str!("╏"),
@@ -466,7 +462,6 @@ impl LineSet {
         }
     }
 
-    #[expect(dead_code)]
     pub fn light_triple_dashed() -> Self {
         Self {
             vertical: lazy_str!("┆"),
@@ -475,7 +470,6 @@ impl LineSet {
         }
     }
 
-    #[expect(dead_code)]
     pub fn heavy_triple_dashed() -> Self {
         Self {
             vertical: lazy_str!("┇"),
@@ -484,7 +478,6 @@ impl LineSet {
         }
     }
 
-    #[expect(dead_code)]
     pub fn light_quadruple_dashed() -> Self {
         Self {
             vertical: lazy_str!("┊"),
@@ -493,7 +486,6 @@ impl LineSet {
         }
     }
 
-    #[expect(dead_code)]
     pub fn heavy_quadruple_dashed() -> Self {
         Self {
             vertical: lazy_str!("┋"),

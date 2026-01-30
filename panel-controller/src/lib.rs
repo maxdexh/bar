@@ -1,6 +1,7 @@
-pub(crate) mod proc;
+mod monitors;
+pub(crate) use bar_common::*;
 
-use proc::{TermEvent, TermUpdate};
+use bar_proc_mgr::{TermEvent, TermUpdate};
 use tempfile::TempDir;
 
 use std::{collections::HashMap, ffi::OsString, sync::Arc, time::Duration};
@@ -41,7 +42,7 @@ impl Default for BarTuiState {
     }
 }
 
-pub async fn run_manager(tui_rx: WatchRx<BarTuiState>, mut reload_tx: ReloadTx) {
+pub async fn run_controller(tui_rx: WatchRx<BarTuiState>, mut reload_tx: ReloadTx) {
     let mut monitors_auto_cancel = HashMap::new();
 
     let mut monitor_rx = crate::monitors::connect();
@@ -413,7 +414,7 @@ async fn init_term(
     let (term_upd_tx, term_upd_rx) = unb_chan();
     let (term_ev_tx, mut term_ev_rx) = unb_chan();
 
-    proc::start_generic_panel(
+    bar_proc_mgr::start_generic_panel(
         &sock_path,
         &log_name,
         term_upd_rx,
@@ -470,7 +471,7 @@ async fn try_init_monitor(
             "-o=foreground=white".into(),
             "-o=background=black".into(),
             // location of the bar
-            format!("--edge={}", crate::panels::EDGE).into(),
+            format!("--edge={}", EDGE).into(),
             // disable hiding the mouse
             "-o=mouse_hide_wait=0".into(),
         ],

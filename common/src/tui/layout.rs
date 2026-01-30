@@ -132,7 +132,7 @@ impl RenderedLayout {
             MK::Moved | MK::Up(_) | MK::Drag(_) => IK::Hover,
         };
 
-        let interact = InteractArgs { kind, _p: () };
+        let interact = InteractArgs { kind };
 
         let font_w = u32::from(font_size.x);
         let font_h = u32::from(font_size.y);

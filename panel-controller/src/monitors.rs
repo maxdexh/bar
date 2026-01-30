@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use futures::Stream;
 
-use crate::utils::unb_chan;
+use bar_common::utils::unb_chan;
 
 #[derive(PartialEq, Clone, Debug)]
 pub struct MonitorInfo {

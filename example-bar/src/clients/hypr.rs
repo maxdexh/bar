@@ -1,7 +1,7 @@
-use crate::data::{BasicDesktopState, BasicWorkspace, WorkspaceId};
-use crate::utils::{ReloadRx, WatchRx, watch_chan};
-use crate::utils::{ResultExt, WatchTx};
+use crate::desktop::{BasicDesktopState, BasicWorkspace, WorkspaceId};
 use anyhow::Context;
+use bar_common::utils::{ReloadRx, WatchRx, watch_chan};
+use bar_common::utils::{ResultExt, WatchTx};
 use futures::StreamExt;
 use hyprland::data::*;
 use hyprland::shared::{HyprData, HyprDataVec};

@@ -22,6 +22,7 @@ pub struct ReloadTx {
     tx: WatchTx<()>,
 }
 impl ReloadTx {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             tx: WatchTx::new(()),

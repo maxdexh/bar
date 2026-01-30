@@ -72,6 +72,7 @@ pub struct CancelDropGuard {
     pub inner: CancellationToken,
 }
 impl CancelDropGuard {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         CancellationToken::new().into()
     }

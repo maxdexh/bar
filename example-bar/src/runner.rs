@@ -1,14 +1,14 @@
 use std::{collections::HashMap, sync::Arc};
 
-use anyhow::Context;
+use anyhow::Context as _;
+use bar_common::{
+    tui,
+    utils::{ReloadRx, ReloadTx, ResultExt as _, WatchRx, WatchTx, watch_chan},
+};
+use bar_panel_controller::BarTuiState;
 use tokio::task::JoinSet;
 
-use crate::{
-    clients,
-    panels::{self, BarTuiState},
-    tui,
-    utils::{ReloadRx, ReloadTx, ResultExt, WatchRx, WatchTx, watch_chan},
-};
+use crate::clients;
 
 #[derive(Clone, Debug)]
 enum BarTuiElem {
@@ -106,7 +106,7 @@ pub async fn main() -> std::process::ExitCode {
     let mut reload_tx = ReloadTx::new();
 
     let bar_tui_tx = WatchTx::new(BarTuiState::default());
-    required_tasks.spawn(panels::run_manager(
+    required_tasks.spawn(bar_panel_controller::run_controller(
         bar_tui_tx.subscribe(),
         reload_tx.clone(),
     ));

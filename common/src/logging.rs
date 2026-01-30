@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use anyhow::Context as _;
 
@@ -10,22 +10,17 @@ fn parse_env<T: std::str::FromStr<Err: std::error::Error + Send + Sync + 'static
         .with_context(|| format!("Failed to parse from env var {name:?}. Value: {val:?} "))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProcKind {
     Controller,
     Panel,
 }
 
-pub fn proc_kind_from_args() -> &'static ProcKind {
-    static PROC_KIND: LazyLock<ProcKind> =
-        LazyLock::new(|| match std::env::args().nth(1).as_deref() {
-            Some(crate::panels::proc::PANEL_PROC_ARG) => ProcKind::Panel,
-            _ => ProcKind::Controller,
-        });
-    &PROC_KIND
-}
+pub const LOG_NAME_ENV_VAR: &str = "BAR_PROC_LOG_NAME";
 
 const COLOR_VAR: &str = "COLOR";
+
+static PROC_NAME: OnceLock<String> = OnceLock::new();
 
 fn format_log(
     w: &mut dyn std::io::Write,
@@ -37,19 +32,20 @@ fn format_log(
         pid: u32,
         proc_name: String,
     }
-    static PROC_NAME: LazyLock<anyhow::Result<String>> =
-        LazyLock::new(|| match proc_kind_from_args() {
-            ProcKind::Controller => Ok("CONTROLLER".into()),
-            ProcKind::Panel => parse_env::<String>(crate::panels::proc::PROC_LOG_NAME_VAR),
-        });
     static FORMAT: LazyLock<Format> = LazyLock::new(|| Format {
         pid: std::process::id(),
+        // FIXME: This is only OK for the controller. The panels should instead use the settings
+        // of the controller.
         color: match std::env::var(COLOR_VAR).as_deref().unwrap_or("auto") {
             "never" | "no" | "off" | "false" => false,
             "always" | "yes" | "on" | "true" => true,
             _ => std::io::IsTerminal::is_terminal(&std::io::stderr()),
         },
-        proc_name: PROC_NAME.as_deref().unwrap_or("UNKNOWN").to_owned(),
+        proc_name: PROC_NAME
+            .get()
+            .map(|s| &**s)
+            .unwrap_or("UNKNOWN")
+            .to_owned(),
     });
     let Format {
         color,
@@ -89,13 +85,14 @@ fn format_log(
     )
 }
 
-pub fn init_logger() {
-    match try_init_logger() {
+pub fn init_logger(proc_kind: ProcKind, log_name: String) {
+    _ = PROC_NAME.set(log_name);
+    match try_init_logger(proc_kind) {
         Ok(_) => log::info!("Started logger"),
         Err(err) => {
             let err = err.context(format!(
                 "Failed to start logger for {:?} (pid {})",
-                proc_kind_from_args(),
+                &proc_kind,
                 std::process::id()
             ));
             eprintln!("{err:?}");
@@ -103,7 +100,12 @@ pub fn init_logger() {
     }
 }
 
-fn try_init_logger() -> anyhow::Result<()> {
+// FIXME: Move most of this function to controller and mgr respectively?
+// I.e. only keep the formatter around in common
+fn try_init_logger(proc_kind: ProcKind) -> anyhow::Result<()> {
+    static PROC_KIND: OnceLock<ProcKind> = OnceLock::new();
+    let proc_kind = PROC_KIND.get_or_init(|| proc_kind);
+
     use flexi_logger::*;
 
     let log_spec: LogSpecification = if cfg!(debug_assertions) {
@@ -113,7 +115,7 @@ fn try_init_logger() -> anyhow::Result<()> {
     };
 
     let logger = Logger::with(log_spec).o_append(true).format(format_log);
-    let logger = match proc_kind_from_args() {
+    let logger = match proc_kind {
         ProcKind::Controller => logger.log_to_stderr(),
         ProcKind::Panel => match parse_env::<std::os::fd::RawFd>("KITTY_STDIO_FORWARDED") {
             Ok(fd) => logger.log_to_file(FileSpec::try_from(format!("/proc/self/fd/{fd}"))?),

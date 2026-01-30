@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+cd -- "$(dirname "$0")"
+
+pushd ..
+export PATH="$PWD/target/rundir/bin:$PATH"
+cargo install --debug --path ./proc-mgr --root ./target/rundir >&2 || exit 1
+popd
+
+cargo run
