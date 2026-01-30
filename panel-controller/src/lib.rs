@@ -57,7 +57,6 @@ pub async fn run_controller(tui_rx: WatchRx<BarTuiState>, mut reload_tx: ReloadT
                 monitor: monitor.clone(),
                 cancel_monitor: cancel.clone(),
                 bar_rx: tui_rx.clone(),
-                reload_tx: reload_tx.clone(),
             }));
             monitors_auto_cancel.insert(monitor.name.clone(), CancelDropGuard::from(cancel));
         }
@@ -70,7 +69,6 @@ struct RunMonitorArgs {
     monitor: MonitorInfo,
     cancel_monitor: CancellationToken,
     bar_rx: WatchRx<BarTuiState>,
-    reload_tx: ReloadTx,
 }
 
 async fn run_monitor(args: RunMonitorArgs) {
@@ -101,7 +99,6 @@ enum TermKind {
 }
 enum Upd {
     BarTui,
-    MenuWatcherHide,
     Term(TermKind, TermEvent),
 }
 
@@ -119,11 +116,7 @@ async fn try_run_monitor(args: &mut RunMonitorArgs) -> anyhow::Result<()> {
     let cancel = args.cancel_monitor.child_token();
     let _auto_cancel = CancelDropGuard::from(cancel.clone());
     let env = try_init_monitor(&args.monitor, &args.bar_rx, &mut required_tasks, &cancel).await?;
-    required_tasks.spawn(run_monitor_mainloop(
-        args.monitor.clone(),
-        args.reload_tx.clone(),
-        env,
-    ));
+    required_tasks.spawn(run_monitor_mainloop(args.monitor.clone(), env));
 
     if let Some(Some(res)) = required_tasks
         .join_next()
@@ -147,7 +140,6 @@ async fn try_run_monitor(args: &mut RunMonitorArgs) -> anyhow::Result<()> {
 
 async fn run_monitor_mainloop(
     monitor: MonitorInfo,
-    mut reload_tx: ReloadTx,
     mut env: StartedMonitorEnv,
 ) -> anyhow::Result<std::convert::Infallible> {
     #[derive(Debug)]
@@ -177,90 +169,91 @@ async fn run_monitor_mainloop(
                     rerender_bar = true;
                 }
             }
-            Upd::Term(term_kind, ev) => match ev {
-                TermEvent::Crossterm(ev) => match ev {
-                    crossterm::event::Event::Mouse(ev) => {
-                        let Some(layout) = (match term_kind {
-                            TermKind::Menu => env.menu.layout.as_mut(),
-                            TermKind::Bar => env.bar.layout.as_mut(),
-                        }) else {
-                            continue;
-                        };
+            Upd::Term(term_kind, TermEvent::Crossterm(ev)) => match ev {
+                crossterm::event::Event::Mouse(ev) => {
+                    let Some(layout) = (match term_kind {
+                        TermKind::Menu => env.menu.layout.as_mut(),
+                        TermKind::Bar => env.bar.layout.as_mut(),
+                    }) else {
+                        continue;
+                    };
 
-                        let tui::MouseEventResult {
-                            interact,
-                            callback,
-                            empty,
-                            changed,
-                            rerender,
-                            pix_location,
-                        } = layout.interpret_mouse_event(ev, env.bar.sizes.font_size());
-                        let is_hover = interact.kind == tui::InteractKind::Hover;
+                    let tui::MouseEventResult {
+                        interact,
+                        callback,
+                        empty,
+                        changed,
+                        rerender,
+                        pix_location,
+                    } = layout.interpret_mouse_event(ev, env.bar.sizes.font_size());
+                    let is_hover = interact.kind == tui::InteractKind::Hover;
 
-                        if term_kind == TermKind::Menu
+                    if term_kind == TermKind::Menu
+                        && let Some(menu) = &show_menu
+                        && menu.kind == MenuKind::Tooltip
+                    {
+                        show_menu = None;
+                        rerender_menu = true;
+                    }
+
+                    if rerender {
+                        match term_kind {
+                            TermKind::Menu => rerender_menu = true,
+                            TermKind::Bar => rerender_bar = true,
+                        }
+                    }
+
+                    if changed || !is_hover {
+                        if empty
+                            && term_kind == TermKind::Bar
                             && let Some(menu) = &show_menu
-                            && menu.kind == MenuKind::Tooltip
+                            && (!is_hover || menu.kind == MenuKind::Tooltip)
                         {
                             show_menu = None;
                             rerender_menu = true;
                         }
 
-                        if rerender {
-                            match term_kind {
-                                TermKind::Menu => rerender_menu = true,
-                                TermKind::Bar => rerender_bar = true,
-                            }
-                        }
-
-                        if changed || !is_hover {
-                            if empty
-                                && term_kind == TermKind::Bar
-                                && let Some(menu) = &show_menu
-                                && (!is_hover || menu.kind == MenuKind::Tooltip)
-                            {
-                                show_menu = None;
-                                rerender_menu = true;
-                            }
-
-                            if let Some(callback) = callback
-                                && let Some(tui::OpenMenu { tui, menu_kind }) =
-                                    callback.call(interact)
-                            {
-                                let sizing = tui::SizingArgs {
-                                    font_size: env.menu.sizes.font_size(),
-                                };
-                                show_menu = Some(ShowMenu {
-                                    cached_size: tui::calc_min_size(&tui, &sizing),
-                                    sizing,
-                                    tui,
-                                    kind: menu_kind,
-                                    pix_location,
-                                });
-                                rerender_menu = true;
-                            }
+                        if let Some(callback) = callback
+                            && let Some(tui::OpenMenu { tui, menu_kind }) = callback.call(interact)
+                        {
+                            let sizing = tui::SizingArgs {
+                                font_size: env.menu.sizes.font_size(),
+                            };
+                            show_menu = Some(ShowMenu {
+                                cached_size: tui::calc_min_size(&tui, &sizing),
+                                sizing,
+                                tui,
+                                kind: menu_kind,
+                                pix_location,
+                            });
+                            rerender_menu = true;
                         }
                     }
-                    _ => {
-                        //
-                    }
-                },
-                // FIXME: Rerender on font size change
-                TermEvent::Sizes(sizes) => match term_kind {
-                    TermKind::Bar => {
-                        env.bar.sizes = sizes;
-                        reload_tx.reload();
-                    }
-                    TermKind::Menu => {
-                        env.menu.sizes = sizes;
-                    }
-                },
+                }
+                _ => {
+                    //
+                }
             },
-            Upd::MenuWatcherHide => {
-                show_menu = None;
-                if let Some(layout) = &mut env.bar.layout
-                    && layout.ext_focus_loss()
-                {
-                    rerender_bar = true;
+            Upd::Term(TermKind::Menu, TermEvent::Sizes(sizes)) => {
+                if sizes.font_size() != env.menu.sizes.font_size() {
+                    rerender_menu = true;
+                }
+                env.menu.sizes = sizes;
+            }
+            Upd::Term(TermKind::Bar, TermEvent::Sizes(sizes)) => {
+                env.bar.sizes = sizes;
+                rerender_bar = true;
+            }
+            Upd::Term(term_kind, TermEvent::FocusChange { is_focused }) => {
+                // FIXME: This only works because the menu doesnt lose focus while we are
+                // on the bar, which forbids focus.
+                if !is_focused && term_kind == TermKind::Menu {
+                    show_menu = None;
+                    if let Some(layout) = &mut env.bar.layout
+                        && layout.ext_focus_loss()
+                    {
+                        rerender_bar = true;
+                    }
                 }
             }
         }
@@ -585,7 +578,8 @@ async fn try_init_monitor(
                     .context("Failed to read from watcher stream")?;
 
                 let parsed = match byte {
-                    0 => Upd::MenuWatcherHide,
+                    0 => Upd::Term(TermKind::Menu, TermEvent::FocusChange { is_focused: false }),
+                    1 => Upd::Term(TermKind::Menu, TermEvent::FocusChange { is_focused: true }),
                     _ => {
                         log::error!("Unknown watcher event {byte}");
                         continue;
