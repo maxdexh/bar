@@ -95,7 +95,10 @@ impl RenderedLayout {
     }
 
     pub fn ext_focus_loss(&mut self) -> bool {
-        let changed = self.last_hover_elem.is_some();
+        let changed = self
+            .last_hover_elem
+            .as_ref()
+            .is_some_and(|it| it.hovered.is_some());
         self.last_mouse_pos = None;
         self.last_hover_elem = None;
         changed
